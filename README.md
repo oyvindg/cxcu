@@ -142,11 +142,14 @@ PNG curve:
 ```bash
 libs/cxcu/tests/run_benchmark_curve.sh
 libs/cxcu/tests/run_benchmark_curve.sh 4096:1024 16384:4096 65536:4096
+CXCU_BENCH_USE_VENV=1 libs/cxcu/tests/run_benchmark_curve.sh --plot-only
 ```
 
 The shell helper builds `test_cxcu_batched_parameter_sweep`, runs each benchmark
 case, stores raw output in `libs/cxcu/build/benchmark/cxcu_benchmark_raw.log`,
 then calls `benchmark_curve.py` to write CSV and PNG outputs from that raw log.
+Use `--plot-only` to regenerate CSV/PNG from an existing raw log without
+rerunning the benchmark.
 
 To create an isolated Python environment for plotting:
 
