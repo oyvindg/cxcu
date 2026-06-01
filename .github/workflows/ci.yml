@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gcc optional cuda
+            cc: gcc
+            cxx: g++
+            build_type: Debug
+            enable_cuda: ON
+          - name: gcc stub
+            cc: gcc
+            cxx: g++
+            build_type: Release
+            enable_cuda: OFF
+          - name: clang optional cuda
+            cc: clang
+            cxx: clang++
+            build_type: Debug
+            enable_cuda: ON
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang cmake ninja-build python3-venv
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCXCU_ENABLE_CUDA=${{ matrix.enable_cuda }} \
+            -DCXCU_BUILD_TESTS=ON \
+            -DCXCU_BUILD_EXAMPLES=ON
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Run examples
+        run: |
+          build/examples/cxcu_example_device_query
+          build/examples/cxcu_example_nvrtc_vector_scale
+
+      - name: Run benchmark helper
+        env:
+          CXCU_BUILD_DIR: ${{ github.workspace }}/build
+          CXCU_BENCH_OUT_DIR: ${{ github.workspace }}/build/benchmark
+          CXCU_BENCH_USE_VENV: "1"
+        run: tests/run_benchmark_curve.sh 256:128
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ matrix.cc }}-${{ matrix.enable_cuda }}
+          path: |
+            build/benchmark/cxcu_benchmark_raw.log
+            build/benchmark/cxcu_benchmark_curve.csv
+            build/benchmark/cxcu_benchmark_curve.png
+          if-no-files-found: ignore
