@@ -24,9 +24,12 @@ GPU_RE = re.compile(
 
 DEFAULT_CASES = (
     (1024, 512),
+    (2048, 1024),
     (4096, 1024),
     (8192, 2048),
     (16384, 4096),
+    (32768, 8192),
+    (65536, 8192),
 )
 
 
@@ -65,6 +68,22 @@ def parse_args() -> argparse.Namespace:
         "--png",
         default="cxcu_benchmark_curve.png",
         help="PNG output path. Use an empty value to skip plotting.",
+    )
+    parser.add_argument(
+        "--speedup-png",
+        help="Speedup PNG output path. Defaults to <png stem>_speedup.png. Use an empty value to skip.",
+    )
+    parser.add_argument(
+        "--per-unit-png",
+        help="Per-work-item PNG output path. Defaults to <png stem>_per_unit.png. Use an empty value to skip.",
+    )
+    parser.add_argument(
+        "--throughput-png",
+        help="Throughput PNG output path. Defaults to <png stem>_throughput.png. Use an empty value to skip.",
+    )
+    parser.add_argument(
+        "--normalized-png",
+        help="Deprecated alias for --per-unit-png.",
     )
     return parser.parse_args()
 
@@ -151,7 +170,15 @@ def write_csv(path: Path, rows: list[dict[str, str]]) -> None:
         writer.writerows(rows)
 
 
+def remove_stale_plot(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
 def plot_png(path: Path, rows: list[dict[str, str]]) -> bool:
+    remove_stale_plot(path)
     try:
         import matplotlib.pyplot as plt
     except ModuleNotFoundError:
@@ -187,10 +214,158 @@ def plot_png(path: Path, rows: list[dict[str, str]]) -> bool:
     return True
 
 
+def plot_speedup_png(path: Path, rows: list[dict[str, str]]) -> bool:
+    remove_stale_plot(path)
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError:
+        print(
+            "matplotlib is not installed; CSV was written. "
+            "Install guide: https://matplotlib.org/stable/users/installing/index.html",
+            file=sys.stderr,
+        )
+        return False
+
+    speedup_rows = [row for row in rows if row["gpu_ms"]]
+    if not speedup_rows:
+        print("no GPU rows available; skipped speedup PNG", file=sys.stderr)
+        return False
+
+    x = [int(row["work_items"]) for row in speedup_rows]
+    speedup = [
+        float(row["speedup"]) if row["speedup"] else float(row["cpu_ms"]) / float(row["gpu_ms"])
+        for row in speedup_rows
+    ]
+
+    plt.figure(figsize=(8, 4.5))
+    plt.plot(x, speedup, marker="o", label="CPU ms / GPU ms")
+    plt.axhline(1.0, color="0.35", linestyle="--", linewidth=1, label="1x")
+    plt.xscale("log")
+    plt.ylim(bottom=0)
+    plt.xlabel("work items (combo_count * item_count)")
+    plt.ylabel("speedup")
+    plt.title("cxcu batched parameter sweep speedup")
+    plt.grid(True, which="both", alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(path, dpi=160)
+    return True
+
+
+def ns_per_work_item(row: dict[str, str], field: str) -> float:
+    work_items = int(row["work_items"])
+    if work_items == 0:
+        return 0.0
+    return float(row[field]) * 1000000.0 / float(work_items)
+
+
+def billion_work_items_per_second(row: dict[str, str], field: str) -> float:
+    elapsed_ms = float(row[field])
+    if elapsed_ms == 0.0:
+        return 0.0
+    return float(row["work_items"]) / (elapsed_ms / 1000.0) / 1000000000.0
+
+
+def plot_per_unit_png(path: Path, rows: list[dict[str, str]]) -> bool:
+    remove_stale_plot(path)
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError:
+        print(
+            "matplotlib is not installed; CSV was written. "
+            "Install guide: https://matplotlib.org/stable/users/installing/index.html",
+            file=sys.stderr,
+        )
+        return False
+
+    x = [int(row["work_items"]) for row in rows]
+    cpu = [ns_per_work_item(row, "cpu_ms") for row in rows]
+    gpu_rows = [row for row in rows if row["gpu_ms"]]
+
+    plt.figure(figsize=(8, 4.5))
+    plt.plot(x, cpu, marker="o", label="CPU ns/work item")
+    if gpu_rows:
+        gpu_x = [int(row["work_items"]) for row in gpu_rows]
+        gpu = [ns_per_work_item(row, "gpu_ms") for row in gpu_rows]
+        kernel = [ns_per_work_item(row, "kernel_ms") for row in gpu_rows]
+        plt.plot(gpu_x, gpu, marker="o", label="GPU total ns/work item")
+        plt.plot(gpu_x, kernel, marker="o", label="Kernel ns/work item")
+
+    plt.xscale("log")
+    plt.yscale("log")
+    plt.xlabel("work items (combo_count * item_count)")
+    plt.ylabel("nanoseconds per work item")
+    plt.title("cxcu batched parameter sweep per-work-item cost")
+    plt.grid(True, which="both", alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(path, dpi=160)
+    return True
+
+
+def plot_throughput_png(path: Path, rows: list[dict[str, str]]) -> bool:
+    remove_stale_plot(path)
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError:
+        print(
+            "matplotlib is not installed; CSV was written. "
+            "Install guide: https://matplotlib.org/stable/users/installing/index.html",
+            file=sys.stderr,
+        )
+        return False
+
+    x = [int(row["work_items"]) for row in rows]
+    cpu = [billion_work_items_per_second(row, "cpu_ms") for row in rows]
+    gpu_rows = [row for row in rows if row["gpu_ms"]]
+
+    plt.figure(figsize=(8, 4.5))
+    plt.plot(x, cpu, marker="o", label="CPU G work items/s")
+    if gpu_rows:
+        gpu_x = [int(row["work_items"]) for row in gpu_rows]
+        gpu = [billion_work_items_per_second(row, "gpu_ms") for row in gpu_rows]
+        kernel = [billion_work_items_per_second(row, "kernel_ms") for row in gpu_rows]
+        plt.plot(gpu_x, gpu, marker="o", label="GPU total G work items/s")
+        plt.plot(gpu_x, kernel, marker="o", label="Kernel G work items/s")
+
+    plt.xscale("log")
+    plt.ylim(bottom=0.0)
+    plt.xlabel("work items (combo_count * item_count)")
+    plt.ylabel("billion work items / second")
+    plt.title("cxcu batched parameter sweep throughput")
+    plt.grid(True, which="both", alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(path, dpi=160)
+    return True
+
+
 def main() -> int:
     args = parse_args()
     cases = tuple((int(c), int(i)) for c, i in args.case) if args.case else DEFAULT_CASES
     png_path = Path(args.png) if args.png else None
+    if args.speedup_png is None:
+        speedup_png_path = (
+            png_path.with_name(f"{png_path.stem}_speedup{png_path.suffix}") if png_path else None
+        )
+    else:
+        speedup_png_path = Path(args.speedup_png) if args.speedup_png else None
+    per_unit_png_arg = args.per_unit_png if args.per_unit_png is not None else args.normalized_png
+    if per_unit_png_arg is None:
+        per_unit_png_path = (
+            png_path.with_name(f"{png_path.stem}_per_unit{png_path.suffix}") if png_path else None
+        )
+    else:
+        per_unit_png_path = Path(per_unit_png_arg) if per_unit_png_arg else None
+    if args.throughput_png is None:
+        throughput_png_path = (
+            png_path.with_name(f"{png_path.stem}_throughput{png_path.suffix}") if png_path else None
+        )
+    else:
+        throughput_png_path = Path(args.throughput_png) if args.throughput_png else None
 
     if args.from_log:
         if not args.from_log.exists():
@@ -223,11 +398,32 @@ def main() -> int:
     png_written = False
     if png_path:
         png_written = plot_png(png_path, rows)
+    speedup_png_written = False
+    if speedup_png_path:
+        speedup_png_written = plot_speedup_png(speedup_png_path, rows)
+    per_unit_png_written = False
+    if per_unit_png_path:
+        per_unit_png_written = plot_per_unit_png(per_unit_png_path, rows)
+    throughput_png_written = False
+    if throughput_png_path:
+        throughput_png_written = plot_throughput_png(throughput_png_path, rows)
     print(f"wrote {args.csv}")
     if png_path and png_written:
         print(f"wrote {png_path}")
     elif png_path:
         print(f"skipped {png_path}")
+    if speedup_png_path and speedup_png_written:
+        print(f"wrote {speedup_png_path}")
+    elif speedup_png_path:
+        print(f"skipped {speedup_png_path}")
+    if per_unit_png_path and per_unit_png_written:
+        print(f"wrote {per_unit_png_path}")
+    elif per_unit_png_path:
+        print(f"skipped {per_unit_png_path}")
+    if throughput_png_path and throughput_png_written:
+        print(f"wrote {throughput_png_path}")
+    elif throughput_png_path:
+        print(f"skipped {throughput_png_path}")
     return 0
 
 
