@@ -140,59 +140,16 @@ Benchmark result:
 | 8192 | 2048 | 351.628 | 0.898 | 0.629 | 0.125 | 0.144 | 93.386 | 391.38x |
 | 16384 | 4096 | 1434.084 | 2.212 | 1.751 | 0.184 | 0.277 | 106.276 | 648.35x |
 
-A small Python helper can run several benchmark sizes and write a CSV plus
-runtime, speedup, per-work-item, and throughput PNG curves:
+The C benchmark can be run directly with explicit workload sizes:
 
 ```bash
-libs/cxcu/tests/run_benchmark_curve.sh
-libs/cxcu/tests/run_benchmark_curve.sh --large
-libs/cxcu/tests/run_benchmark_curve.sh --huge
-libs/cxcu/tests/run_benchmark_curve.sh 4096:1024 16384:4096 65536:4096
-CXCU_BENCH_USE_VENV=1 libs/cxcu/tests/run_benchmark_curve.sh --plot-only
+libs/cxcu/build/tests/test_cxcu_batched_parameter_sweep 4096 1024
+libs/cxcu/build/tests/test_cxcu_batched_parameter_sweep 16384 4096
+libs/cxcu/build/tests/test_cxcu_batched_parameter_sweep 65536 4096
 ```
 
-The shell helper builds `test_cxcu_batched_parameter_sweep`, runs each benchmark
-case, stores raw output in `libs/cxcu/build/benchmark/cxcu_benchmark_raw.log`,
-then calls `benchmark_curve.py` to write CSV and PNG outputs from that raw log:
-
-- `libs/cxcu/build/benchmark/cxcu_benchmark_curve.png`: CPU/GPU runtime
-- `libs/cxcu/build/benchmark/cxcu_benchmark_speedup.png`: `cpu_ms / gpu_ms`
-- `libs/cxcu/build/benchmark/cxcu_benchmark_per_unit.png`: nanoseconds per
-  work item for CPU, GPU total, and kernel runtime
-- `libs/cxcu/build/benchmark/cxcu_benchmark_throughput.png`: billion work
-  items per second for CPU, GPU total, and kernel runtime
-
-Use `--plot-only` to regenerate CSV/PNG from an existing raw log without
-rerunning the benchmark. The default profile uses seven cases for a clearer
-curve; `--quick` uses two short cases, `--large` extends the curve with heavier
-cases, and `--huge` is intended for a longer run that makes the CPU/GPU split
-more visible in the PNG.
-
-To create an isolated Python environment for plotting:
-
-```bash
-CXCU_BENCH_USE_VENV=1 CXCU_BENCH_INSTALL_DEPS=1 libs/cxcu/tests/run_benchmark_curve.sh
-```
-
-`CXCU_BENCH_INSTALL_DEPS=1` installs `matplotlib` into
-`libs/cxcu/build/benchmark/.venv`. Without it, the helper still writes CSV and
-skips PNG if `matplotlib` is not already available. Set `CXCU_PYTHON` to choose
-a specific Python 3 executable.
-
-The Python plotter can also be called directly:
-
-```bash
-python3 libs/cxcu/tests/benchmark_curve.py \
-  --from-log libs/cxcu/build/benchmark/cxcu_benchmark_raw.log \
-  --csv /tmp/cxcu_benchmark_curve.csv \
-  --png /tmp/cxcu_benchmark_curve.png \
-  --speedup-png /tmp/cxcu_benchmark_speedup.png \
-  --per-unit-png /tmp/cxcu_benchmark_per_unit.png \
-  --throughput-png /tmp/cxcu_benchmark_throughput.png
-```
-
-Plotting uses `matplotlib` when available. If it is missing, the helper still
-writes the CSV and prints an install link.
+The benchmark prints parseable timing lines to stdout. Redirect that output if
+you want to compare runs over time.
 
 ## Initial API Surface
 
