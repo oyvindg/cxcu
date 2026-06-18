@@ -20,9 +20,13 @@ the codebase portable:
 - manage CUDA contexts and streams
 - allocate and free device buffers
 - copy data between host and device memory
+- allocate-and-upload host data in one call and track buffer groups for cleanup
 - load PTX/CUBIN modules
 - compile runtime CUDA source to a loadable module image, preferring
   device-specific CUBIN and falling back to PTX
+- optionally cache compiled module images on disk using a caller-supplied
+  namespace, directory, and filename prefix
+- concatenate generated CUDA source fragments without host-specific knowledge
 - launch kernels through a narrow C API
 - expose useful CUDA error strings
 

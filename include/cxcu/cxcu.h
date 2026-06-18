@@ -73,6 +73,16 @@ typedef struct cxcu_buffer {
     size_t bytes;
 } cxcu_buffer;
 
+/** @brief Caller-owned group of buffers that can be freed together. */
+typedef struct cxcu_buffer_group {
+    /** Caller-owned storage of buffer pointers. */
+    cxcu_buffer** buffers;
+    /** Number of tracked buffers. */
+    size_t count;
+    /** Capacity of @p buffers. */
+    size_t capacity;
+} cxcu_buffer_group;
+
 /** @brief Opaque loaded CUDA module. */
 typedef struct cxcu_module {
     /** Opaque CUDA module handle value. */
@@ -108,6 +118,22 @@ typedef struct cxcu_module_image {
     /** NVRTC architecture option used for the image, if known. */
     char architecture[32];
 } cxcu_module_image;
+
+/** @brief Optional disk cache configuration for compiled module images. */
+typedef struct cxcu_module_cache {
+    /** Enables cache lookup/write when non-zero. */
+    int enabled;
+    /** Directory where cached images are stored. Required when enabled. */
+    const char* directory;
+    /** Cache namespace/version tag included in the hash key. Required when enabled. */
+    const char* namespace_tag;
+    /** Filename prefix for cache entries. Optional. */
+    const char* file_prefix;
+    /** Filename extension for cache entries, such as ".cubin". Optional. */
+    const char* file_extension;
+    /** CUDA device ordinal used in the device-specific hash key. */
+    int device_ordinal;
+} cxcu_module_cache;
 
 /** @brief Opaque CUDA stream. */
 typedef struct cxcu_stream {
@@ -196,10 +222,45 @@ void cxcu_stream_destroy(cxcu_stream* stream);
 int cxcu_buffer_alloc(cxcu_buffer* out_buffer, size_t bytes, cxcu_error* err);
 
 /**
+ * @brief Allocate CUDA device memory and copy host bytes into it.
+ */
+int cxcu_buffer_alloc_upload(cxcu_buffer* out_buffer, const void* host, size_t bytes, cxcu_error* err);
+
+/**
  * @brief Free CUDA device memory and clear the buffer.
  * @param buffer Buffer to free. May be NULL.
  */
 void cxcu_buffer_free(cxcu_buffer* buffer);
+
+/**
+ * @brief Initialize a caller-owned buffer group.
+ */
+void cxcu_buffer_group_init(cxcu_buffer_group* group, cxcu_buffer** storage, size_t capacity);
+
+/**
+ * @brief Track an already allocated buffer in a group.
+ */
+int cxcu_buffer_group_add(cxcu_buffer_group* group, cxcu_buffer* buffer, cxcu_error* err);
+
+/**
+ * @brief Allocate a buffer and track it in a group.
+ */
+int cxcu_buffer_group_alloc(cxcu_buffer_group* group, cxcu_buffer* out_buffer, size_t bytes, cxcu_error* err);
+
+/**
+ * @brief Allocate, upload host bytes, and track the buffer in a group.
+ */
+int cxcu_buffer_group_alloc_upload(
+    cxcu_buffer_group* group,
+    cxcu_buffer* out_buffer,
+    const void* host,
+    size_t bytes,
+    cxcu_error* err);
+
+/**
+ * @brief Free all tracked buffers in reverse order and clear the group count.
+ */
+void cxcu_buffer_group_free_all(cxcu_buffer_group* group);
 
 /**
  * @brief Copy bytes from host memory to a CUDA device buffer.
@@ -277,6 +338,61 @@ int cxcu_compile_module_image_for_device(
     int device_ordinal,
     cxcu_module_image* out_image,
     cxcu_error* err);
+
+/**
+ * @brief Build the cache key and path for a compiled module image.
+ */
+int cxcu_module_cache_path(
+    const cxcu_module_cache* cache,
+    const char* cuda_source,
+    const char* const* options,
+    size_t option_count,
+    char* out_path,
+    size_t out_path_size,
+    char* out_key,
+    size_t out_key_size,
+    cxcu_error* err);
+
+/**
+ * @brief Return whether a non-empty cached module image exists for the inputs.
+ */
+int cxcu_module_cache_image_exists(
+    const cxcu_module_cache* cache,
+    const char* cuda_source,
+    const char* const* options,
+    size_t option_count);
+
+/**
+ * @brief Read a cached module image from an explicit cache path.
+ */
+int cxcu_module_cache_read_image(const char* path, cxcu_module_image* out_image);
+
+/**
+ * @brief Atomically write a cached module image to an explicit cache path.
+ */
+int cxcu_module_cache_write_image(const char* path, const void* data, size_t size);
+
+/**
+ * @brief Compile CUDA C source with optional disk-cache lookup/write.
+ */
+int cxcu_compile_module_image_cached(
+    const cxcu_module_cache* cache,
+    const char* cuda_source,
+    const char* program_name,
+    const char* const* options,
+    size_t option_count,
+    cxcu_module_image* out_image,
+    cxcu_error* err);
+
+/**
+ * @brief Concatenate source fragments, stripping trailing NUL and adding newline separators.
+ */
+char* cxcu_source_concat(const unsigned char* const* sources, const size_t* sizes, size_t count);
+
+/**
+ * @brief Format a cxcu error into a caller buffer as "prefix: message".
+ */
+void cxcu_error_format(const char* prefix, const cxcu_error* err, char* buf, size_t size);
 
 /**
  * @brief Release PTX data produced by cxcu_compile_ptx().
