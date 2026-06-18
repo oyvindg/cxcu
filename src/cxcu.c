@@ -1280,6 +1280,262 @@ int cxcu_compile_module_image_for_device(
     return cxcu_stub_unavailable(err);
 }
 
+int cxcu_buffer_alloc_upload(cxcu_buffer* out_buffer, const void* host, size_t bytes, cxcu_error* err) {
+    if (!out_buffer || !host || bytes == 0u) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "valid output buffer and host data are required");
+        if (out_buffer) memset(out_buffer, 0, sizeof(*out_buffer));
+        return 0;
+    }
+    if (out_buffer) memset(out_buffer, 0, sizeof(*out_buffer));
+    return cxcu_stub_unavailable(err);
+}
+
+void cxcu_buffer_group_init(cxcu_buffer_group* group, cxcu_buffer** storage, size_t capacity) {
+    if (!group) return;
+    group->buffers = storage;
+    group->count = 0u;
+    group->capacity = storage ? capacity : 0u;
+}
+
+int cxcu_buffer_group_add(cxcu_buffer_group* group, cxcu_buffer* buffer, cxcu_error* err) {
+    if (!group || !group->buffers || !buffer || group->count >= group->capacity) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "buffer group capacity exceeded");
+        return 0;
+    }
+    group->buffers[group->count++] = buffer;
+    cxcu_error_clear(err);
+    return 1;
+}
+
+int cxcu_buffer_group_alloc(cxcu_buffer_group* group, cxcu_buffer* out_buffer, size_t bytes, cxcu_error* err) {
+    if (!cxcu_buffer_alloc(out_buffer, bytes, err)) return 0;
+    if (!cxcu_buffer_group_add(group, out_buffer, err)) {
+        cxcu_buffer_free(out_buffer);
+        return 0;
+    }
+    return 1;
+}
+
+int cxcu_buffer_group_alloc_upload(
+    cxcu_buffer_group* group,
+    cxcu_buffer* out_buffer,
+    const void* host,
+    size_t bytes,
+    cxcu_error* err) {
+    if (!cxcu_buffer_alloc_upload(out_buffer, host, bytes, err)) return 0;
+    if (!cxcu_buffer_group_add(group, out_buffer, err)) {
+        cxcu_buffer_free(out_buffer);
+        return 0;
+    }
+    return 1;
+}
+
+void cxcu_buffer_group_free_all(cxcu_buffer_group* group) {
+    size_t i;
+    if (!group || !group->buffers) return;
+    for (i = group->count; i > 0u; --i) {
+        cxcu_buffer_free(group->buffers[i - 1u]);
+    }
+    group->count = 0u;
+}
+
+int cxcu_module_cache_path(
+    const cxcu_module_cache* cache,
+    const char* cuda_source,
+    const char* const* options,
+    size_t option_count,
+    char* out_path,
+    size_t out_path_size,
+    char* out_key,
+    size_t out_key_size,
+    cxcu_error* err) {
+    char device_key[384];
+    uint64_t h1 = 14695981039346656037ULL;
+    uint64_t h2 = 1099511628211ULL;
+    const char* prefix;
+    const char* extension;
+    int written;
+    size_t i;
+
+    if (out_path && out_path_size > 0u) out_path[0] = '\0';
+    if (out_key && out_key_size > 0u) out_key[0] = '\0';
+    if (!cache || !cache->enabled || !cache->directory || cache->directory[0] == '\0' ||
+        !cache->namespace_tag || cache->namespace_tag[0] == '\0' || !cuda_source ||
+        !out_path || out_path_size == 0u || !out_key || out_key_size == 0u) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "invalid module cache arguments");
+        return 0;
+    }
+
+    (void)snprintf(device_key, sizeof(device_key), "device=unknown");
+    device_key[sizeof(device_key) - 1u] = '\0';
+
+    h1 = cxcu_fnv1a_update_string(h1, cache->namespace_tag);
+    h1 = cxcu_fnv1a_update_string(h1, device_key);
+    h1 = cxcu_fnv1a_update_string(h1, cuda_source);
+    h1 = cxcu_fnv1a_update(h1, &option_count, sizeof(option_count));
+    h2 = cxcu_fnv1a_update_string_with_suffix(h2, cache->namespace_tag, "b");
+    h2 = cxcu_fnv1a_update_string(h2, device_key);
+    h2 = cxcu_fnv1a_update_string(h2, cuda_source);
+    h2 = cxcu_fnv1a_update(h2, &option_count, sizeof(option_count));
+    for (i = 0u; i < option_count; ++i) {
+        h1 = cxcu_fnv1a_update_string(h1, options ? options[i] : "");
+        h2 = cxcu_fnv1a_update_string(h2, options ? options[i] : "");
+    }
+
+    written = snprintf(
+        out_key,
+        out_key_size,
+        "%016llx%016llx",
+        (unsigned long long)h1,
+        (unsigned long long)h2);
+    if (written <= 0 || (size_t)written >= out_key_size) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "module cache key buffer is too small");
+        return 0;
+    }
+    prefix = cache->file_prefix ? cache->file_prefix : "";
+    extension = cache->file_extension ? cache->file_extension : "";
+    written = snprintf(out_path, out_path_size, "%s/%s%s%s", cache->directory, prefix, out_key, extension);
+    if (written <= 0 || (size_t)written >= out_path_size) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "module cache path buffer is too small");
+        return 0;
+    }
+    cxcu_error_clear(err);
+    return 1;
+}
+
+int cxcu_module_cache_read_image(const char* path, cxcu_module_image* out_image) {
+    FILE* in;
+    long size;
+    void* data = NULL;
+    size_t nread;
+
+    if (out_image) memset(out_image, 0, sizeof(*out_image));
+    if (!path || !out_image) return 0;
+    in = fopen(path, "rb");
+    if (!in) return 0;
+    if (fseek(in, 0, SEEK_END) != 0) {
+        fclose(in);
+        return 0;
+    }
+    size = ftell(in);
+    if (size <= 0 || fseek(in, 0, SEEK_SET) != 0) {
+        fclose(in);
+        return 0;
+    }
+    data = malloc((size_t)size);
+    if (!data) {
+        fclose(in);
+        return 0;
+    }
+    nread = fread(data, 1u, (size_t)size, in);
+    fclose(in);
+    if (nread != (size_t)size) {
+        free(data);
+        return 0;
+    }
+    out_image->data = data;
+    out_image->size = (size_t)size;
+    out_image->kind = CXCU_MODULE_IMAGE_CUBIN;
+    (void)snprintf(out_image->architecture, sizeof(out_image->architecture), "%s", "cache");
+    out_image->architecture[sizeof(out_image->architecture) - 1u] = '\0';
+    return 1;
+}
+
+int cxcu_module_cache_write_image(const char* path, const void* data, size_t size) {
+    char tmp_path[PATH_MAX];
+    FILE* out;
+    const char* slash;
+    char dir[PATH_MAX];
+    size_t dir_len;
+    int written;
+    int ok = 0;
+
+    if (!path || !data || size == 0u) return 0;
+    slash = strrchr(path, '/');
+    if (slash) {
+        dir_len = (size_t)(slash - path);
+        if (dir_len == 0u || dir_len >= sizeof(dir)) return 0;
+        memcpy(dir, path, dir_len);
+        dir[dir_len] = '\0';
+        if (!cxcu_mkdir_p(dir)) return 0;
+    }
+    written = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    if (written <= 0 || (size_t)written >= sizeof(tmp_path)) return 0;
+
+    out = fopen(tmp_path, "wb");
+    if (!out) return 0;
+    if (fwrite(data, 1u, size, out) == size && fflush(out) == 0) ok = 1;
+    if (fclose(out) != 0) ok = 0;
+    if (!ok) {
+        (void)remove(tmp_path);
+        return 0;
+    }
+    if (rename(tmp_path, path) != 0) {
+        (void)remove(tmp_path);
+        return 0;
+    }
+    return 1;
+}
+
+int cxcu_module_cache_image_exists(
+    const cxcu_module_cache* cache,
+    const char* cuda_source,
+    const char* const* options,
+    size_t option_count) {
+    char path[PATH_MAX];
+    char key[65];
+    if (!cxcu_module_cache_path(
+            cache,
+            cuda_source,
+            options,
+            option_count,
+            path,
+            sizeof(path),
+            key,
+            sizeof(key),
+            NULL)) {
+        return 0;
+    }
+    return cxcu_file_exists(path);
+}
+
+int cxcu_compile_module_image_cached(
+    const cxcu_module_cache* cache,
+    const char* cuda_source,
+    const char* program_name,
+    const char* const* options,
+    size_t option_count,
+    cxcu_module_image* out_image,
+    cxcu_error* err) {
+    char path[PATH_MAX];
+    char key[65];
+    int have_path = 0;
+
+    (void)program_name;
+    if (!cuda_source || !out_image) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "CUDA source and out_image are required");
+        return 0;
+    }
+    memset(out_image, 0, sizeof(*out_image));
+    if (cache && cache->enabled) {
+        have_path = cxcu_module_cache_path(
+            cache,
+            cuda_source,
+            options,
+            option_count,
+            path,
+            sizeof(path),
+            key,
+            sizeof(key),
+            NULL);
+        if (have_path && cxcu_module_cache_read_image(path, out_image)) {
+            cxcu_error_clear(err);
+            return 1;
+        }
+    }
+    return cxcu_stub_unavailable(err);
+}
+
 void cxcu_ptx_free(cxcu_ptx* ptx) {
     if (ptx) memset(ptx, 0, sizeof(*ptx));
 }
