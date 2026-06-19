@@ -82,28 +82,28 @@ available, it falls back to PTX.
 ## Build
 
 ```bash
-cmake -S libs/cxcu -B libs/cxcu/build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-cmake --build libs/cxcu/build -j4
-ctest --test-dir libs/cxcu/build --output-on-failure
+cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+cmake --build build -j4
+ctest --test-dir build --output-on-failure
 ```
 
 CUDA support is enabled by default when CMake can find the CUDA Driver API:
 
 ```bash
-cmake -S libs/cxcu -B libs/cxcu/build -DCXCU_ENABLE_CUDA=ON
+cmake -S . -B build -DCXCU_ENABLE_CUDA=ON
 ```
 
 To force a portable unavailable stub:
 
 ```bash
-cmake -S libs/cxcu -B libs/cxcu/build -DCXCU_ENABLE_CUDA=OFF
+cmake -S . -B build -DCXCU_ENABLE_CUDA=OFF
 ```
 
 To build the standalone examples:
 
 ```bash
-cmake -S libs/cxcu -B libs/cxcu/build -DCXCU_BUILD_EXAMPLES=ON
-cmake --build libs/cxcu/build -j4
+cmake -S . -B build -DCXCU_BUILD_EXAMPLES=ON
+cmake --build build -j4
 ```
 
 See `examples/` for host-agnostic device discovery and file-based `.cu` runtime
@@ -115,9 +115,9 @@ compilation examples.
 optional CUDA implementation of the same synthetic batched workload:
 
 ```bash
-cmake -S libs/cxcu -B libs/cxcu/build -DCXCU_BUILD_TESTS=ON
-cmake --build libs/cxcu/build -j4
-libs/cxcu/build/tests/test_cxcu_batched_parameter_sweep 65536 4096
+cmake -S . -B build -DCXCU_BUILD_TESTS=ON
+cmake --build build -j4
+build/tests/test_cxcu_batched_parameter_sweep 65536 4096
 ```
 
 The output includes:
@@ -143,9 +143,9 @@ Benchmark result:
 The C benchmark can be run directly with explicit workload sizes:
 
 ```bash
-libs/cxcu/build/tests/test_cxcu_batched_parameter_sweep 4096 1024
-libs/cxcu/build/tests/test_cxcu_batched_parameter_sweep 16384 4096
-libs/cxcu/build/tests/test_cxcu_batched_parameter_sweep 65536 4096
+build/tests/test_cxcu_batched_parameter_sweep 4096 1024
+build/tests/test_cxcu_batched_parameter_sweep 16384 4096
+build/tests/test_cxcu_batched_parameter_sweep 65536 4096
 ```
 
 The benchmark prints parseable timing lines to stdout. Redirect that output if
@@ -190,16 +190,16 @@ The workload is shaped like a generic batched parameter sweep:
 - one CUDA thread per grid combo, with each thread looping over all input items
 
 ```bash
-cmake --build libs/cxcu/build -j4
-libs/cxcu/build/tests/test_cxcu_grid_bench
+cmake --build build -j4
+build/tests/test_cxcu_grid_bench
 ```
 
 Useful modes:
 
 ```bash
-libs/cxcu/build/tests/test_cxcu_grid_bench --smoke
-libs/cxcu/build/tests/test_cxcu_grid_bench --full
-libs/cxcu/build/tests/test_cxcu_grid_bench --case 65536 4096
+build/tests/test_cxcu_grid_bench --smoke
+build/tests/test_cxcu_grid_bench --full
+build/tests/test_cxcu_grid_bench --case 65536 4096
 ```
 
 The printed `gpu_ms` value includes host-to-device copy, kernel execution, and

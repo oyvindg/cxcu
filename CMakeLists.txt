@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(cxcu VERSION 0.1.0 LANGUAGES C)
 
 include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -54,6 +55,22 @@ install(
     EXPORT cxcuTargets
     FILE cxcuTargets.cmake
     NAMESPACE cxcu::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cxcu
+)
+configure_package_config_file(
+    cmake/cxcuConfig.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/cxcuConfig.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cxcu
+)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/cxcuConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+install(
+    FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/cxcuConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/cxcuConfigVersion.cmake"
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cxcu
 )
 
