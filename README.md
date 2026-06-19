@@ -28,10 +28,25 @@ writing details to an optional `cxcu_error*`.
 
 ## Quick start
 
+Minimal CMake consumer:
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(cxcu_quick_start LANGUAGES C)
+
+find_package(cxcu CONFIG REQUIRED)
+
+add_executable(quick_start main.c)
+target_link_libraries(quick_start PRIVATE cxcu::cxcu)
+```
+
+`main.c`:
+
 ```c
 #include <cxcu/cxcu.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 /* CUDA source compiled at runtime. */
 static const char* kernel_source =
@@ -41,8 +56,31 @@ static const char* kernel_source =
     "    if (i < n) out[i] = in[i] * k;\n"
     "}\n";
 
+static int fail(const char* operation, const cxcu_error* err) {
+    fprintf(stderr, "%s: %s\n", operation, err && err->message[0] ? err->message : "failed");
+    return 1;
+}
+
 int main(void) {
+    enum { item_count = 16 };
+    const char* options[] = {"--std=c++11"};
     cxcu_error err = {0};
+    cxcu_module_image image = {0};
+    cxcu_module module = {0};
+    cxcu_buffer input_buffer = {0};
+    cxcu_buffer output_buffer = {0};
+    cxcu_buffer* buffers[2];
+    cxcu_buffer_group group = {0};
+    float input[item_count];
+    float output[item_count];
+    unsigned int n = item_count;
+    float scale = 1.75f;
+    uintptr_t input_ptr;
+    uintptr_t output_ptr;
+    void* args[4];
+    cxcu_launch_config cfg;
+    int rc = 1;
+    unsigned int i;
 
     /* 1. Probe. When unavailable, fall back to a CPU path instead of failing. */
     if (!cxcu_available(&err)) {
@@ -51,58 +89,78 @@ int main(void) {
     }
 
     /* 2. Compile to a loadable image (CUBIN if possible, else PTX). */
-    const char* opts[] = {"--std=c++11"};
-    cxcu_module_image image = {0};
     if (!cxcu_compile_module_image_for_device(
-            kernel_source, "scale.cu", opts, 1, /*device*/ 0, &image, &err)) {
-        fprintf(stderr, "compile failed: %s\n", err.message);
-        return 1;
+            kernel_source, "scale.cu", options, 1, 0, &image, &err)) {
+        return fail("compile", &err);
+    }
+    if (!cxcu_module_load_data(&module, image.data, image.size, &err)) {
+        rc = fail("module load", &err);
+        goto cleanup;
     }
 
-    cxcu_module module = {0};
-    cxcu_module_load_data(&module, image.data, image.size, &err);
-
     /* 3. Upload input, allocate output. A buffer group frees everything later. */
-    enum { N = 16 };
-    float in[N], out[N];
-    for (unsigned i = 0; i < N; ++i) in[i] = (float)i;
+    for (i = 0; i < item_count; ++i) input[i] = (float)i;
 
-    cxcu_buffer in_buf = {0}, out_buf = {0};
-    cxcu_buffer* storage[2];
-    cxcu_buffer_group group;
-    cxcu_buffer_group_init(&group, storage, 2);
-    cxcu_buffer_group_alloc_upload(&group, &in_buf, in, sizeof(in), &err);
-    cxcu_buffer_group_alloc(&group, &out_buf, sizeof(out), &err);
+    cxcu_buffer_group_init(&group, buffers, 2);
+    if (!cxcu_buffer_group_alloc_upload(&group, &input_buffer, input, sizeof(input), &err)) {
+        rc = fail("input upload", &err);
+        goto cleanup;
+    }
+    if (!cxcu_buffer_group_alloc(&group, &output_buffer, sizeof(output), &err)) {
+        rc = fail("output allocation", &err);
+        goto cleanup;
+    }
 
     /* 4. Launch: one thread per element. */
-    uint64_t in_ptr = in_buf.device_ptr, out_ptr = out_buf.device_ptr;
-    uint32_t n = N;
-    float k = 1.75f;
-    void* args[] = {&in_ptr, &out_ptr, &n, &k};
+    input_ptr = input_buffer.device_ptr;
+    output_ptr = output_buffer.device_ptr;
+    args[0] = &input_ptr;
+    args[1] = &output_ptr;
+    args[2] = &n;
+    args[3] = &scale;
 
-    cxcu_launch_config cfg = {0};
+    memset(&cfg, 0, sizeof(cfg));
     cfg.grid_x = cfg.grid_y = cfg.grid_z = 1;
-    cfg.block_x = N; cfg.block_y = cfg.block_z = 1;
+    cfg.block_x = item_count;
+    cfg.block_y = cfg.block_z = 1;
 
-    cxcu_launch(&module, "scale", &cfg, args, &err);
-    cxcu_synchronize(&err);
+    if (!cxcu_launch(&module, "scale", &cfg, args, &err)) {
+        rc = fail("kernel launch", &err);
+        goto cleanup;
+    }
+    if (!cxcu_synchronize(&err)) {
+        rc = fail("synchronize", &err);
+        goto cleanup;
+    }
 
     /* 5. Copy back. */
-    cxcu_memcpy_d2h(out, &out_buf, sizeof(out), &err);
-    printf("out[0]=%.2f out[%d]=%.2f\n", out[0], N - 1, out[N - 1]);
+    if (!cxcu_memcpy_d2h(output, &output_buffer, sizeof(output), &err)) {
+        rc = fail("copy result", &err);
+        goto cleanup;
+    }
+    printf("output[0]=%.2f output[%u]=%.2f\n", output[0], item_count - 1, output[item_count - 1]);
+    rc = 0;
 
-    /* 6. Clean up. */
+cleanup:
     cxcu_buffer_group_free_all(&group);
     cxcu_module_unload(&module);
     cxcu_module_image_free(&image);
     cxcu_shutdown();
-    return 0;
+    return rc;
 }
 ```
 
-Error handling is omitted on a few calls above for brevity; in real code check
-each return value and inspect `err.message` (or `err.status ==
-CXCU_STATUS_UNAVAILABLE` to treat CUDA as simply absent).
+Install `cxcu` first, then build the consumer with the install prefix:
+
+```bash
+cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/tmp/cxcu-install
+cmake --build build -j4
+cmake --install build
+
+cmake -S quick-start -B quick-start/build -DCMAKE_PREFIX_PATH=/tmp/cxcu-install
+cmake --build quick-start/build -j4
+quick-start/build/quick_start
+```
 
 See **[`examples/`](examples/)** for complete, runnable programs:
 
