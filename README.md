@@ -38,7 +38,7 @@ no CUDA-capable GPU, driver, or runtime is available.
 ```text
 host application or domain library
 optional CUDA backend adapter
-cxcu                         generic CUDA bridge, standalone C
+cxcu (generic CUDA bridge, standalone C)
 ```
 
 `cxcu` owns generic CUDA mechanics. A host-specific adapter owns the meaning of
