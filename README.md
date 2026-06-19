@@ -1,5 +1,8 @@
 # cxcu
 
+[![CI](https://github.com/oyvindg/cxcu/actions/workflows/ci.yml/badge.svg)](https://github.com/oyvindg/cxcu/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 `cxcu` is a small, standalone **C11 bridge for optional CUDA integration**. It
 isolates CUDA runtime and driver plumbing from domain libraries, so a project
 can detect and use NVIDIA GPUs without making its core C code depend on
