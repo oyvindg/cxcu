@@ -552,6 +552,14 @@ static void cxcu_set_nvrtc_error(
         text ? text : "NVRTC_ERROR_UNKNOWN");
 }
 
+static int cxcu_build_nvrtc_options_with_default_include(const char* const* options,
+                                                        size_t option_count,
+                                                        char include_options[][PATH_MAX + 32],
+                                                        size_t include_option_cap,
+                                                        const char*** out_options,
+                                                        size_t* out_count,
+                                                        cxcu_error* err);
+
 int cxcu_compile_ptx(
     const char* cuda_source,
     const char* program_name,
@@ -561,6 +569,9 @@ int cxcu_compile_ptx(
     cxcu_error* err) {
     nvrtcProgram program = NULL;
     nvrtcResult result;
+    const char** effective_options = NULL;
+    size_t effective_option_count = 0u;
+    char include_options[6][PATH_MAX + 32];
     char* ptx = NULL;
     char* log = NULL;
     size_t log_size = 0u;
@@ -572,6 +583,16 @@ int cxcu_compile_ptx(
         return 0;
     }
     memset(out_ptx, 0, sizeof(*out_ptx));
+    if (!cxcu_build_nvrtc_options_with_default_include(
+            options,
+            option_count,
+            include_options,
+            sizeof(include_options) / sizeof(include_options[0]),
+            &effective_options,
+            &effective_option_count,
+            err)) {
+        return 0;
+    }
 
     result = nvrtcCreateProgram(
         &program,
@@ -582,10 +603,10 @@ int cxcu_compile_ptx(
         NULL);
     if (result != NVRTC_SUCCESS) {
         cxcu_set_nvrtc_error(err, result, "nvrtcCreateProgram", NULL);
-        return 0;
+        goto cleanup;
     }
 
-    result = nvrtcCompileProgram(program, (int)option_count, options);
+    result = nvrtcCompileProgram(program, (int)effective_option_count, effective_options);
     (void)nvrtcGetProgramLogSize(program, &log_size);
     if (log_size > 1u) {
         log = (char*)malloc(log_size);
@@ -619,6 +640,7 @@ int cxcu_compile_ptx(
     ok = 1;
 
 cleanup:
+    free(effective_options);
     free(ptx);
     free(log);
     if (program) (void)nvrtcDestroyProgram(&program);
@@ -635,6 +657,201 @@ static int cxcu_nvrtc_option_is_arch_assignment(const char* option) {
     return option &&
            (strncmp(option, "--gpu-architecture=", 19u) == 0 ||
             strncmp(option, "-arch=", 6u) == 0);
+}
+
+static int cxcu_path_contains_file(const char* dir, const char* filename) {
+    char path[PATH_MAX];
+    struct stat st;
+    if (!dir || dir[0] == '\0' || !filename || filename[0] == '\0') return 0;
+    if (snprintf(path, sizeof(path), "%s/%s", dir, filename) >= (int)sizeof(path)) return 0;
+    return stat(path, &st) == 0;
+}
+
+static int cxcu_append_nvrtc_include_option(char include_options[][PATH_MAX + 32],
+                                            size_t include_option_cap,
+                                            size_t* count,
+                                            const char* dir,
+                                            cxcu_error* err) {
+    if (!include_options || !count || *count >= include_option_cap || !dir || dir[0] == '\0') return 1;
+    if (snprintf(include_options[*count], PATH_MAX + 32, "--include-path=%s", dir) >= PATH_MAX + 32) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "NVRTC include path is too long");
+        return 0;
+    }
+    *count += 1u;
+    return 1;
+}
+
+static int cxcu_append_host_c_include_tail(char include_options[][PATH_MAX + 32],
+                                           size_t include_option_cap,
+                                           size_t* count,
+                                           cxcu_error* err) {
+    static const char* const compiler_include_dirs[] = {
+        "/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "/usr/lib/gcc/x86_64-linux-gnu/13/include",
+        "/usr/lib/gcc/x86_64-linux-gnu/12/include",
+        "/usr/lib/gcc/x86_64-linux-gnu/11/include",
+        "/usr/lib/gcc/x86_64-linux-gnu/10/include",
+        "/usr/lib/llvm-20/lib/clang/20/include",
+        "/usr/lib/llvm-18/lib/clang/18/include",
+    };
+    size_t i;
+
+    for (i = 0u; i < sizeof(compiler_include_dirs) / sizeof(compiler_include_dirs[0]); ++i) {
+        if (cxcu_path_contains_file(compiler_include_dirs[i], "stddef.h")) {
+            if (!cxcu_append_nvrtc_include_option(
+                    include_options, include_option_cap, count, compiler_include_dirs[i], err)) {
+                return 0;
+            }
+            break;
+        }
+    }
+    if (cxcu_path_contains_file("/usr/include/x86_64-linux-gnu", "bits/libc-header-start.h") &&
+        !cxcu_append_nvrtc_include_option(
+            include_options, include_option_cap, count, "/usr/include/x86_64-linux-gnu", err)) {
+        return 0;
+    }
+    if (cxcu_path_contains_file("/usr/include", "stdlib.h") &&
+        !cxcu_append_nvrtc_include_option(
+            include_options, include_option_cap, count, "/usr/include", err)) {
+        return 0;
+    }
+    return 1;
+}
+
+static int cxcu_default_nvrtc_include_dirs(char include_options[][PATH_MAX + 32],
+                                           size_t include_option_cap,
+                                           size_t* out_count,
+                                           cxcu_error* err) {
+    const char* cuda_home = getenv("CUDA_HOME");
+    const char* cuda_path = getenv("CUDA_PATH");
+    char env_include[PATH_MAX];
+    char env_libcxx_include[PATH_MAX];
+    size_t count = 0u;
+
+    if (out_count) *out_count = 0u;
+    if (!include_options || !out_count) return 1;
+
+    if (cuda_home && cuda_home[0] != '\0') {
+        if (snprintf(env_include, sizeof(env_include), "%s/include", cuda_home) < (int)sizeof(env_include) &&
+            cxcu_path_contains_file(env_include, "math.h")) {
+            if (!cxcu_append_nvrtc_include_option(include_options, include_option_cap, &count, env_include, err)) return 0;
+            *out_count = count;
+            return 1;
+        }
+        if (snprintf(env_include, sizeof(env_include), "%s/targets/x86_64-linux/include", cuda_home) <
+                (int)sizeof(env_include) &&
+            snprintf(env_libcxx_include, sizeof(env_libcxx_include),
+                     "%s/cuda/std/detail/libcxx/include", env_include) <
+                (int)sizeof(env_libcxx_include) &&
+            cxcu_path_contains_file(env_include, "nv/target") &&
+            cxcu_path_contains_file(env_libcxx_include, "math.h")) {
+            if (!cxcu_append_nvrtc_include_option(include_options, include_option_cap, &count, env_include, err) ||
+                !cxcu_append_nvrtc_include_option(include_options, include_option_cap, &count, env_libcxx_include, err) ||
+                !cxcu_append_host_c_include_tail(include_options, include_option_cap, &count, err)) {
+                return 0;
+            }
+            *out_count = count;
+            return 1;
+        }
+    }
+    if (cuda_path && cuda_path[0] != '\0') {
+        if (snprintf(env_include, sizeof(env_include), "%s/include", cuda_path) < (int)sizeof(env_include) &&
+            cxcu_path_contains_file(env_include, "math.h")) {
+            if (!cxcu_append_nvrtc_include_option(include_options, include_option_cap, &count, env_include, err)) return 0;
+            *out_count = count;
+            return 1;
+        }
+        if (snprintf(env_include, sizeof(env_include), "%s/targets/x86_64-linux/include", cuda_path) <
+                (int)sizeof(env_include) &&
+            snprintf(env_libcxx_include, sizeof(env_libcxx_include),
+                     "%s/cuda/std/detail/libcxx/include", env_include) <
+                (int)sizeof(env_libcxx_include) &&
+            cxcu_path_contains_file(env_include, "nv/target") &&
+            cxcu_path_contains_file(env_libcxx_include, "math.h")) {
+            if (!cxcu_append_nvrtc_include_option(include_options, include_option_cap, &count, env_include, err) ||
+                !cxcu_append_nvrtc_include_option(include_options, include_option_cap, &count, env_libcxx_include, err) ||
+                !cxcu_append_host_c_include_tail(include_options, include_option_cap, &count, err)) {
+                return 0;
+            }
+            *out_count = count;
+            return 1;
+        }
+    }
+    if (cxcu_path_contains_file("/usr/local/cuda/targets/x86_64-linux/include", "nv/target") &&
+        cxcu_path_contains_file(
+            "/usr/local/cuda/targets/x86_64-linux/include/cuda/std/detail/libcxx/include",
+            "math.h")) {
+        if (!cxcu_append_nvrtc_include_option(
+                include_options, include_option_cap, &count,
+                "/usr/local/cuda/targets/x86_64-linux/include", err) ||
+            !cxcu_append_nvrtc_include_option(
+                include_options, include_option_cap, &count,
+                "/usr/local/cuda/targets/x86_64-linux/include/cuda/std/detail/libcxx/include", err) ||
+            !cxcu_append_host_c_include_tail(include_options, include_option_cap, &count, err)) {
+            return 0;
+        }
+        *out_count = count;
+        return 1;
+    }
+    if (cxcu_path_contains_file("/usr/local/cuda-12.3/targets/x86_64-linux/include", "nv/target") &&
+        cxcu_path_contains_file(
+            "/usr/local/cuda-12.3/targets/x86_64-linux/include/cuda/std/detail/libcxx/include",
+            "math.h")) {
+        if (!cxcu_append_nvrtc_include_option(
+                include_options, include_option_cap, &count,
+                "/usr/local/cuda-12.3/targets/x86_64-linux/include", err) ||
+            !cxcu_append_nvrtc_include_option(
+                include_options, include_option_cap, &count,
+                "/usr/local/cuda-12.3/targets/x86_64-linux/include/cuda/std/detail/libcxx/include", err) ||
+            !cxcu_append_host_c_include_tail(include_options, include_option_cap, &count, err)) {
+            return 0;
+        }
+        *out_count = count;
+        return 1;
+    }
+    if (cxcu_path_contains_file("/usr/local/cuda/include", "math.h")) {
+        if (!cxcu_append_nvrtc_include_option(
+                include_options, include_option_cap, &count, "/usr/local/cuda/include", err)) {
+            return 0;
+        }
+    }
+    *out_count = count;
+    return 1;
+}
+
+static int cxcu_build_nvrtc_options_with_default_include(const char* const* options,
+                                                        size_t option_count,
+                                                        char include_options[][PATH_MAX + 32],
+                                                        size_t include_option_cap,
+                                                        const char*** out_options,
+                                                        size_t* out_count,
+                                                        cxcu_error* err) {
+    const char** result = NULL;
+    size_t include_count = 0u;
+    size_t count = 0u;
+    size_t i;
+
+    if (out_options) *out_options = NULL;
+    if (out_count) *out_count = 0u;
+    if (!out_options || !out_count || !include_options || include_option_cap == 0u) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "NVRTC option output is required");
+        return 0;
+    }
+    if (!cxcu_default_nvrtc_include_dirs(include_options, include_option_cap, &include_count, err)) return 0;
+
+    result = (const char**)calloc(option_count + include_count, sizeof(*result));
+    if (!result && (option_count > 0u || include_count > 0u)) {
+        cxcu_set_error(err, CXCU_STATUS_OUT_OF_MEMORY, 0, "failed to allocate NVRTC options");
+        return 0;
+    }
+    for (i = 0u; i < option_count; ++i) {
+        if (options && options[i]) result[count++] = options[i];
+    }
+    for (i = 0u; i < include_count; ++i) result[count++] = include_options[i];
+
+    *out_options = result;
+    *out_count = count;
+    return 1;
 }
 
 static int cxcu_build_sm_arch_option(int device_ordinal,
@@ -712,8 +929,11 @@ static int cxcu_compile_cubin_for_device(
     cxcu_module_image* out_image,
     cxcu_error* err) {
     char arch_option[64];
+    const char** effective_options = NULL;
+    size_t effective_option_count = 0u;
     const char** cubin_options = NULL;
     size_t cubin_option_count = 0u;
+    char include_options[6][PATH_MAX + 32];
     nvrtcProgram program = NULL;
     nvrtcResult result;
     char* cubin = NULL;
@@ -725,13 +945,26 @@ static int cxcu_compile_cubin_for_device(
     if (!cxcu_build_sm_arch_option(device_ordinal, arch_option, sizeof(arch_option), err)) {
         return 0;
     }
+    if (!cxcu_build_nvrtc_options_with_default_include(
+            options,
+            option_count,
+            include_options,
+            sizeof(include_options) / sizeof(include_options[0]),
+            &effective_options,
+            &effective_option_count,
+            err)) {
+        return 0;
+    }
     cubin_options = cxcu_build_cubin_options(
-        options,
-        option_count,
+        effective_options,
+        effective_option_count,
         arch_option,
         &cubin_option_count,
         err);
-    if (!cubin_options) return 0;
+    if (!cubin_options) {
+        free(effective_options);
+        return 0;
+    }
 
     result = nvrtcCreateProgram(
         &program,
@@ -789,6 +1022,7 @@ cleanup:
     free(cubin);
     free(log);
     free(cubin_options);
+    free(effective_options);
     if (program) (void)nvrtcDestroyProgram(&program);
     return ok;
 }
