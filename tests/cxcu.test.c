@@ -265,6 +265,35 @@ static void test_optional_kernel_launch_smoke(void) {
     printf("  ok test_optional_kernel_launch_smoke\n");
 }
 
+static void test_optional_nvrtc_default_include_smoke(void) {
+    static const char* source =
+        "#include <nv/target>\n"
+        "extern \"C\" __global__ void cxcu_nvrtc_default_include(unsigned int* out, unsigned int count) {\n"
+        "    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+        "    if (i < count) out[i] = i + 13u;\n"
+        "}\n";
+    static const char* options[] = {
+        "--std=c++11",
+        "--gpu-architecture=compute_50"
+    };
+    cxcu_error err = {0};
+    cxcu_ptx ptx = {0};
+
+    if (!cxcu_compile_ptx(source, "cxcu_nvrtc_default_include.cu", options, 2u, &ptx, &err)) {
+        if (err.status == CXCU_STATUS_UNAVAILABLE) {
+            printf("  ok test_optional_nvrtc_default_include_smoke skipped: %s\n", err.message);
+            return;
+        }
+        fprintf(stderr, "NVRTC default include smoke failed: %s\n", err.message);
+        assert(0);
+    }
+    assert(ptx.data != NULL);
+    assert(ptx.size > 0u);
+    assert(strstr(ptx.data, "cxcu_nvrtc_default_include") != NULL);
+    cxcu_ptx_free(&ptx);
+    printf("  ok test_optional_nvrtc_default_include_smoke\n");
+}
+
 static void test_optional_nvrtc_compile_smoke(void) {
     static const char* source =
         "extern \"C\" __global__ void cxcu_nvrtc_fill(unsigned int* out, unsigned int count) {\n"
@@ -361,6 +390,7 @@ int main(void) {
     test_buffer_group_helpers();
     test_availability_and_optional_copy();
     test_optional_kernel_launch_smoke();
+    test_optional_nvrtc_default_include_smoke();
     test_optional_nvrtc_compile_smoke();
     return 0;
 }
