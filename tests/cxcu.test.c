@@ -381,6 +381,55 @@ static void test_optional_nvrtc_compile_smoke(void) {
     printf("  ok test_optional_nvrtc_compile_smoke\n");
 }
 
+static void test_optional_run_kernel_helpers(void) {
+    static const char* source =
+        "extern \"C\" __global__ void square(const unsigned int* in, unsigned int* out, unsigned int count) {\n"
+        "  unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+        "  if (i < count) out[i] = in[i] * in[i];\n"
+        "}\n"
+        "extern \"C\" __global__ void resident_probe(unsigned long long* size_out, void* state,\n"
+        "  const void* params, const void* inputs, const void* active, void* outputs,\n"
+        "  unsigned long long candidates, unsigned long long params_n,\n"
+        "  unsigned long long inputs_n, unsigned long long ticks) {\n"
+        "  (void)params; (void)inputs; (void)active; (void)outputs; (void)candidates;\n"
+        "  (void)params_n; (void)inputs_n; (void)ticks;\n"
+        "  if (!state && blockIdx.x == 0 && threadIdx.x == 0) *size_out = 48;\n"
+        "}\n";
+    const unsigned int input[] = {2u, 3u, 4u, 5u};
+    unsigned int output[4] = {0};
+    unsigned int count = 4u;
+    size_t state_size = 0u;
+    cxcu_arg args[] = {
+        {CXCU_ARG_IN, (void*)input, sizeof(input)},
+        {CXCU_ARG_OUT, output, sizeof(output)},
+        {CXCU_ARG_SCALAR, &count, sizeof(count)}
+    };
+    cxcu_launch_config cfg = {1u, 1u, 1u, 4u, 1u, 1u, 0u, NULL};
+    cxcu_module_image image = {0};
+    cxcu_module module = {0};
+    cxcu_error err = {0};
+    if (!cxcu_available(&err)) {
+        printf("  ok test_optional_run_kernel_helpers skipped: %s\n", err.message);
+        return;
+    }
+    if (!cxcu_compile_module_image_for_device(source, "helpers.cu", NULL, 0u,
+                                               0, &image, &err)) {
+        printf("  ok test_optional_run_kernel_helpers skipped: %s\n", err.message);
+        return;
+    }
+    assert(cxcu_module_load_data(&module, image.data, image.size, &err));
+    assert(cxcu_run_kernel(&module, "square", &cfg, args,
+                           sizeof(args) / sizeof(args[0]), &err));
+    assert(output[0] == 4u && output[1] == 9u &&
+           output[2] == 16u && output[3] == 25u);
+    assert(cxcu_query_kernel_state_size(&module, "resident_probe", &state_size, &err));
+    assert(state_size == 48u);
+    cxcu_module_unload(&module);
+    cxcu_module_image_free(&image);
+    cxcu_shutdown();
+    printf("  ok test_optional_run_kernel_helpers\n");
+}
+
 int main(void) {
     test_status_names();
     test_error_clear();
@@ -392,5 +441,6 @@ int main(void) {
     test_optional_kernel_launch_smoke();
     test_optional_nvrtc_default_include_smoke();
     test_optional_nvrtc_compile_smoke();
+    test_optional_run_kernel_helpers();
     return 0;
 }
