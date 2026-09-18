@@ -48,7 +48,7 @@ typedef struct cxcu_error {
     /** Raw CUDA error code when available, otherwise 0. */
     int cuda_code;
     /** Human-readable, null-terminated error message. */
-    char message[256];
+    char message[2048];
 } cxcu_error;
 
 /** @brief Basic information about a CUDA device. */
@@ -160,6 +160,19 @@ typedef struct cxcu_launch_config {
     /** Optional stream for the launch. NULL uses the default stream. */
     const cxcu_stream* stream;
 } cxcu_launch_config;
+
+typedef enum cxcu_arg_kind {
+    CXCU_ARG_IN = 0,
+    CXCU_ARG_OUT = 1,
+    CXCU_ARG_INOUT = 2,
+    CXCU_ARG_SCALAR = 3
+} cxcu_arg_kind;
+
+typedef struct cxcu_arg {
+    cxcu_arg_kind kind;
+    void* host_ptr;
+    size_t bytes;
+} cxcu_arg;
 
 /**
  * @brief Reset an error object to CXCU_STATUS_OK.
@@ -339,6 +352,18 @@ int cxcu_compile_module_image_for_device(
     cxcu_module_image* out_image,
     cxcu_error* err);
 
+int cxcu_compile_named_module_image_for_device(
+    const char* cuda_source,
+    const char* program_name,
+    const char* const* options,
+    size_t option_count,
+    int device_ordinal,
+    const char* name_expression,
+    char* out_lowered_name,
+    size_t out_lowered_name_size,
+    cxcu_module_image* out_image,
+    cxcu_error* err);
+
 /**
  * @brief Build the cache key and path for a compiled module image.
  */
@@ -422,6 +447,13 @@ void cxcu_module_unload(cxcu_module* module);
  * @return 1 on success, otherwise 0.
  */
 int cxcu_launch(cxcu_module* module, const char* kernel_name, const cxcu_launch_config* cfg, void** args, cxcu_error* err);
+
+int cxcu_run_kernel(cxcu_module* module, const char* kernel_name,
+                    const cxcu_launch_config* cfg, const cxcu_arg* args,
+                    size_t arg_count, cxcu_error* err);
+
+int cxcu_query_kernel_state_size(cxcu_module* module, const char* kernel_name,
+                                 size_t* out_size, cxcu_error* err);
 
 /**
  * @brief Synchronize the current cxcu CUDA context.

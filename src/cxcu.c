@@ -541,7 +541,7 @@ static void cxcu_set_nvrtc_error(
             err,
             CXCU_STATUS_COMPILE_ERROR,
             (int)result,
-            "%s failed: %s: %.180s",
+            "%s failed: %s: %.1900s",
             operation ? operation : "NVRTC call",
             text ? text : "NVRTC_ERROR_UNKNOWN",
             log);
@@ -916,6 +916,9 @@ static int cxcu_compile_cubin_for_device(
     const char* const* options,
     size_t option_count,
     int device_ordinal,
+    const char* name_expression,
+    char* out_lowered_name,
+    size_t out_lowered_name_size,
     cxcu_module_image* out_image,
     cxcu_error* err) {
     char arch_option[64];
@@ -967,6 +970,13 @@ static int cxcu_compile_cubin_for_device(
         cxcu_set_nvrtc_error(err, result, "nvrtcCreateProgram", NULL);
         goto cleanup;
     }
+    if (name_expression) {
+        result = nvrtcAddNameExpression(program, name_expression);
+        if (result != NVRTC_SUCCESS) {
+            cxcu_set_nvrtc_error(err, result, "nvrtcAddNameExpression", NULL);
+            goto cleanup;
+        }
+    }
 
     result = nvrtcCompileProgram(program, (int)cubin_option_count, cubin_options);
     (void)nvrtcGetProgramLogSize(program, &log_size);
@@ -977,6 +987,17 @@ static int cxcu_compile_cubin_for_device(
     if (result != NVRTC_SUCCESS) {
         cxcu_set_nvrtc_error(err, result, "nvrtcCompileProgram", log);
         goto cleanup;
+    }
+    if (name_expression) {
+        const char* lowered_name = NULL;
+        result = nvrtcGetLoweredName(program, name_expression, &lowered_name);
+        if (result != NVRTC_SUCCESS || !lowered_name || !out_lowered_name ||
+            out_lowered_name_size == 0u) {
+            cxcu_set_nvrtc_error(err, result, "nvrtcGetLoweredName", log);
+            goto cleanup;
+        }
+        (void)snprintf(out_lowered_name, out_lowered_name_size, "%s", lowered_name);
+        out_lowered_name[out_lowered_name_size - 1u] = '\0';
     }
 
     result = nvrtcGetCUBINSize(program, &cubin_size);
@@ -1040,6 +1061,9 @@ int cxcu_compile_module_image_for_device(
             options,
             option_count,
             device_ordinal,
+            NULL,
+            NULL,
+            0u,
             out_image,
             &cubin_err)) {
         cxcu_error_clear(err);
@@ -1059,6 +1083,26 @@ int cxcu_compile_module_image_for_device(
     ptx.size = 0u;
     cxcu_error_clear(err);
     return 1;
+}
+
+int cxcu_compile_named_module_image_for_device(
+    const char* cuda_source, const char* program_name,
+    const char* const* options, size_t option_count, int device_ordinal,
+    const char* name_expression, char* out_lowered_name,
+    size_t out_lowered_name_size, cxcu_module_image* out_image,
+    cxcu_error* err) {
+    if (!cuda_source || !name_expression || !out_lowered_name ||
+        out_lowered_name_size == 0u || !out_image) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0,
+                       "named module compile arguments are required");
+        return 0;
+    }
+    out_lowered_name[0] = '\0';
+    memset(out_image, 0, sizeof(*out_image));
+    return cxcu_compile_cubin_for_device(
+        cuda_source, program_name, options, option_count, device_ordinal,
+        name_expression, out_lowered_name, out_lowered_name_size,
+        out_image, err);
 }
 
 #else
@@ -1375,6 +1419,112 @@ int cxcu_launch(
         return 0;
     }
     cxcu_error_clear(err);
+    return 1;
+}
+
+int cxcu_run_kernel(cxcu_module* module, const char* kernel_name,
+                    const cxcu_launch_config* cfg, const cxcu_arg* args,
+                    size_t arg_count, cxcu_error* err) {
+    cxcu_buffer* buffers = NULL;
+    cxcu_buffer** storage = NULL;
+    uint64_t* device_ptrs = NULL;
+    void** launch_args = NULL;
+    cxcu_buffer_group group;
+    int ok = 0;
+    if (!module || !kernel_name || !cfg || (arg_count && !args)) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0,
+                       "kernel run arguments are required");
+        return 0;
+    }
+    buffers = (cxcu_buffer*)calloc(arg_count, sizeof(*buffers));
+    storage = (cxcu_buffer**)calloc(arg_count, sizeof(*storage));
+    device_ptrs = (uint64_t*)calloc(arg_count, sizeof(*device_ptrs));
+    launch_args = (void**)calloc(arg_count, sizeof(*launch_args));
+    if (arg_count && (!buffers || !storage || !device_ptrs || !launch_args)) {
+        cxcu_set_error(err, CXCU_STATUS_OUT_OF_MEMORY, 0,
+                       "out of memory preparing kernel arguments");
+        goto cleanup;
+    }
+    cxcu_buffer_group_init(&group, storage, arg_count);
+    for (size_t i = 0u; i < arg_count; ++i) {
+        if (args[i].kind == CXCU_ARG_SCALAR) {
+            if (!args[i].host_ptr || args[i].bytes == 0u) {
+                cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0,
+                               "scalar kernel argument is empty");
+                goto cleanup_group;
+            }
+            launch_args[i] = args[i].host_ptr;
+            continue;
+        }
+        if (args[i].kind != CXCU_ARG_IN && args[i].kind != CXCU_ARG_OUT &&
+            args[i].kind != CXCU_ARG_INOUT) {
+            cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0,
+                           "unknown kernel argument kind");
+            goto cleanup_group;
+        }
+        if (args[i].bytes != 0u && !args[i].host_ptr) {
+            cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0,
+                           "kernel buffer argument has no host storage");
+            goto cleanup_group;
+        }
+        if (args[i].bytes != 0u) {
+            const int allocated = args[i].kind == CXCU_ARG_IN ||
+                                  args[i].kind == CXCU_ARG_INOUT
+                ? cxcu_buffer_group_alloc_upload(&group, &buffers[i],
+                                                 args[i].host_ptr, args[i].bytes, err)
+                : cxcu_buffer_group_alloc(&group, &buffers[i], args[i].bytes, err);
+            if (!allocated) goto cleanup_group;
+            device_ptrs[i] = (uint64_t)buffers[i].device_ptr;
+        }
+        launch_args[i] = &device_ptrs[i];
+    }
+    if (!cxcu_launch(module, kernel_name, cfg, launch_args, err) ||
+        !cxcu_synchronize(err)) goto cleanup_group;
+    for (size_t i = 0u; i < arg_count; ++i) {
+        if ((args[i].kind == CXCU_ARG_OUT || args[i].kind == CXCU_ARG_INOUT) &&
+            args[i].bytes != 0u &&
+            !cxcu_memcpy_d2h(args[i].host_ptr, &buffers[i], args[i].bytes, err))
+            goto cleanup_group;
+    }
+    ok = 1;
+cleanup_group:
+    cxcu_buffer_group_free_all(&group);
+cleanup:
+    free(launch_args);
+    free(device_ptrs);
+    free(storage);
+    free(buffers);
+    return ok;
+}
+
+int cxcu_query_kernel_state_size(cxcu_module* module, const char* kernel_name,
+                                 size_t* out_size, cxcu_error* err) {
+    size_t candidate_count = 1u;
+    size_t zero = 0u;
+    cxcu_launch_config cfg = {1u, 1u, 1u, 1u, 1u, 1u, 0u, NULL};
+    cxcu_arg args[] = {
+        {CXCU_ARG_OUT, out_size, sizeof(*out_size)},
+        {CXCU_ARG_IN, NULL, 0u}, {CXCU_ARG_IN, NULL, 0u},
+        {CXCU_ARG_IN, NULL, 0u}, {CXCU_ARG_IN, NULL, 0u},
+        {CXCU_ARG_IN, NULL, 0u},
+        {CXCU_ARG_SCALAR, &candidate_count, sizeof(candidate_count)},
+        {CXCU_ARG_SCALAR, &zero, sizeof(zero)},
+        {CXCU_ARG_SCALAR, &zero, sizeof(zero)},
+        {CXCU_ARG_SCALAR, &zero, sizeof(zero)}
+    };
+    if (!out_size) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0,
+                       "state size output is required");
+        return 0;
+    }
+    *out_size = 0u;
+    if (!cxcu_run_kernel(module, kernel_name, &cfg, args,
+                         sizeof(args) / sizeof(args[0]), err)) return 0;
+    if (*out_size == 0u) {
+        cxcu_set_error(err, CXCU_STATUS_CUDA_ERROR, 0,
+                       "kernel returned an empty state size");
+        return 0;
+    }
     return 1;
 }
 
@@ -1778,6 +1928,25 @@ int cxcu_launch(
     (void)kernel_name;
     (void)cfg;
     (void)args;
+    return cxcu_stub_unavailable(err);
+}
+
+int cxcu_run_kernel(cxcu_module* module, const char* kernel_name,
+                    const cxcu_launch_config* cfg, const cxcu_arg* args,
+                    size_t arg_count, cxcu_error* err) {
+    (void)module;
+    (void)kernel_name;
+    (void)cfg;
+    (void)args;
+    (void)arg_count;
+    return cxcu_stub_unavailable(err);
+}
+
+int cxcu_query_kernel_state_size(cxcu_module* module, const char* kernel_name,
+                                 size_t* out_size, cxcu_error* err) {
+    (void)module;
+    (void)kernel_name;
+    if (out_size) *out_size = 0u;
     return cxcu_stub_unavailable(err);
 }
 
