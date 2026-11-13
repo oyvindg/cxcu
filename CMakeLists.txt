@@ -13,10 +13,26 @@ option(CXCU_BUILD_TESTS "Build cxcu tests" ${PROJECT_IS_TOP_LEVEL})
 option(CXCU_BUILD_EXAMPLES "Build cxcu examples" ${PROJECT_IS_TOP_LEVEL})
 
 set(CXCU_HAVE_CUDA OFF)
+set(CXCU_CUDA_DRIVER_LINK "")
 if(CXCU_ENABLE_CUDA)
     find_package(CUDAToolkit QUIET)
     if(CUDAToolkit_FOUND AND TARGET CUDA::cuda_driver)
         set(CXCU_HAVE_CUDA ON)
+        find_library(CXCU_SYSTEM_CUDA_DRIVER
+            NAMES cuda libcuda.so.1
+            PATHS
+                "/lib/${CMAKE_LIBRARY_ARCHITECTURE}"
+                "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}"
+                /lib64
+                /usr/lib64
+            NO_DEFAULT_PATH)
+        if(CXCU_SYSTEM_CUDA_DRIVER)
+            set(CXCU_CUDA_DRIVER_LINK "${CXCU_SYSTEM_CUDA_DRIVER}")
+            message(STATUS "CXCU CUDA driver: ${CXCU_SYSTEM_CUDA_DRIVER}")
+        else()
+            set(CXCU_CUDA_DRIVER_LINK CUDA::cuda_driver)
+            message(STATUS "CXCU CUDA driver target: CUDA::cuda_driver")
+        endif()
     else()
         message(STATUS "CUDA Driver API not found. Building cxcu unavailable stub.")
     endif()
@@ -34,7 +50,7 @@ target_include_directories(cxcu PUBLIC
 
 if(CXCU_HAVE_CUDA)
     target_compile_definitions(cxcu PRIVATE CXCU_HAVE_CUDA=1)
-    target_link_libraries(cxcu PRIVATE CUDA::cuda_driver)
+    target_link_libraries(cxcu PRIVATE ${CXCU_CUDA_DRIVER_LINK})
     if(TARGET CUDA::nvrtc)
         get_filename_component(CXCU_CUDA_TOOLKIT_ROOT "${CUDAToolkit_BIN_DIR}/.." ABSOLUTE)
         target_compile_definitions(cxcu PRIVATE CXCU_HAVE_NVRTC=1)

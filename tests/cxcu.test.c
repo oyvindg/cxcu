@@ -381,6 +381,97 @@ static void test_optional_nvrtc_compile_smoke(void) {
     printf("  ok test_optional_nvrtc_compile_smoke\n");
 }
 
+static void test_optional_run_kernel_helpers(void) {
+    static const char* source =
+        "extern \"C\" __global__ void square(const unsigned int* in, unsigned int* out, unsigned int count) {\n"
+        "  unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+        "  if (i < count) out[i] = in[i] * in[i];\n"
+        "}\n"
+        "extern \"C\" __global__ void resident_probe(unsigned long long* size_out, void* state,\n"
+        "  const void* params, const void* inputs, const void* active, void* outputs,\n"
+        "  unsigned long long candidates, unsigned long long params_n,\n"
+        "  unsigned long long inputs_n, unsigned long long ticks) {\n"
+        "  (void)params; (void)inputs; (void)active; (void)outputs; (void)candidates;\n"
+        "  (void)params_n; (void)inputs_n; (void)ticks;\n"
+        "  if (!state && blockIdx.x == 0 && threadIdx.x == 0) *size_out = 48;\n"
+        "}\n";
+    const unsigned int input[] = {2u, 3u, 4u, 5u};
+    unsigned int output[4] = {0};
+    unsigned int count = 4u;
+    size_t state_size = 0u;
+    cxcu_arg args[] = {
+        {CXCU_ARG_IN, (void*)input, sizeof(input)},
+        {CXCU_ARG_OUT, output, sizeof(output)},
+        {CXCU_ARG_SCALAR, &count, sizeof(count)}
+    };
+    cxcu_launch_config cfg = {1u, 1u, 1u, 4u, 1u, 1u, 0u, NULL};
+    cxcu_module_image image = {0};
+    cxcu_module module = {0};
+    cxcu_error err = {0};
+    if (!cxcu_available(&err)) {
+        printf("  ok test_optional_run_kernel_helpers skipped: %s\n", err.message);
+        return;
+    }
+    if (!cxcu_compile_module_image_for_device(source, "helpers.cu", NULL, 0u,
+                                               0, &image, &err)) {
+        printf("  ok test_optional_run_kernel_helpers skipped: %s\n", err.message);
+        return;
+    }
+    assert(cxcu_module_load_data(&module, image.data, image.size, &err));
+    assert(cxcu_run_kernel(&module, "square", &cfg, args,
+                           sizeof(args) / sizeof(args[0]), &err));
+    assert(output[0] == 4u && output[1] == 9u &&
+           output[2] == 16u && output[3] == 25u);
+    assert(cxcu_query_kernel_state_size(&module, "resident_probe", &state_size, &err));
+    assert(state_size == 48u);
+    cxcu_module_unload(&module);
+    cxcu_module_image_free(&image);
+    cxcu_shutdown();
+    printf("  ok test_optional_run_kernel_helpers\n");
+}
+
+static void test_device_view_residency(void) {
+    const double values[] = {1.0, 2.0, 3.0, 4.0, 5.0, 6.0};
+    cxcu_device_view_binding binding = {
+        .host_data = values,
+        .element_type = CXCU_DEVICE_VIEW_NUMBER,
+        .rank = 2u,
+        .shape = {2u, 3u},
+        .capacity_bytes = sizeof(values),
+        .generation = 17u,
+        .flags = CXCU_DEVICE_VIEW_READ_ONLY | CXCU_DEVICE_VIEW_CONTIGUOUS,
+    };
+    cxcu_device_view_descriptor descriptor = {0};
+    cxcu_device_view_capability capability = {0};
+    cxcu_device_view_plan plan;
+    cxcu_error err = {0};
+    assert(cxcu_device_view_capability_get(0, &capability, &err));
+    assert(capability.abi_version == CXCU_DEVICE_VIEW_ABI_VERSION);
+    assert((capability.element_types & (1u << CXCU_DEVICE_VIEW_UINT32)) != 0u);
+    assert(capability.max_rank == 4u);
+    cxcu_device_view_plan_init(&plan, 0);
+    if (!capability.device_available) {
+        assert(!cxcu_device_view_plan_bind(&plan, &binding, 1u, &descriptor, &err));
+        assert(err.status == CXCU_STATUS_UNAVAILABLE || err.status == CXCU_STATUS_CUDA_ERROR);
+        printf("  ok test_device_view_residency skipped: %s\n", err.message);
+        return;
+    }
+    assert(cxcu_device_view_plan_bind(&plan, &binding, 1u, &descriptor, &err));
+    assert(descriptor.device_ptr != 0u);
+    assert(descriptor.rank == 2u);
+    assert(descriptor.shape[0] == 2u && descriptor.shape[1] == 3u);
+    assert(descriptor.element_strides[0] == 3u && descriptor.element_strides[1] == 1u);
+    assert(plan.upload_count == 1u && plan.reuse_count == 0u);
+    assert(cxcu_device_view_plan_bind(&plan, &binding, 1u, &descriptor, &err));
+    assert(plan.upload_count == 1u && plan.reuse_count == 1u);
+    binding.generation = 18u;
+    assert(cxcu_device_view_plan_bind(&plan, &binding, 1u, &descriptor, &err));
+    assert(plan.upload_count == 2u && descriptor.generation == 18u);
+    cxcu_device_view_plan_free(&plan);
+    cxcu_shutdown();
+    printf("  ok test_device_view_residency\n");
+}
+
 int main(void) {
     test_status_names();
     test_error_clear();
@@ -392,5 +483,7 @@ int main(void) {
     test_optional_kernel_launch_smoke();
     test_optional_nvrtc_default_include_smoke();
     test_optional_nvrtc_compile_smoke();
+    test_optional_run_kernel_helpers();
+    test_device_view_residency();
     return 0;
 }

@@ -6,12 +6,191 @@
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
+#include <stddef.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
+
+static void cxcu_set_error(
+    cxcu_error* err,
+    cxcu_status status,
+    int cuda_code,
+    const char* format,
+    ...);
+
+_Static_assert(sizeof(cxcu_device_view_descriptor) == 96u,
+    "device view descriptor ABI must match cxcu/device_view.cuh");
+
+static size_t cxcu_device_view_element_size(cxcu_device_view_element_type type) {
+    switch (type) {
+        case CXCU_DEVICE_VIEW_NUMBER: return sizeof(double);
+        case CXCU_DEVICE_VIEW_INT64: return sizeof(int64_t);
+        case CXCU_DEVICE_VIEW_BOOL: return sizeof(uint8_t);
+        case CXCU_DEVICE_VIEW_UINT32: return sizeof(uint32_t);
+        default: return 0u;
+    }
+}
+
+int cxcu_device_view_capability_get(
+    int device_ordinal,
+    cxcu_device_view_capability* out_capability,
+    cxcu_error* err) {
+    cxcu_error availability = {0};
+    if (!out_capability) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "device view capability output is required");
+        return 0;
+    }
+    memset(out_capability, 0, sizeof(*out_capability));
+    out_capability->abi_version = CXCU_DEVICE_VIEW_ABI_VERSION;
+    out_capability->max_rank = CXCU_DEVICE_VIEW_MAX_RANK;
+    out_capability->max_views = CXCU_DEVICE_VIEW_MAX_COUNT;
+    out_capability->element_types =
+        (1u << CXCU_DEVICE_VIEW_NUMBER) |
+        (1u << CXCU_DEVICE_VIEW_INT64) |
+        (1u << CXCU_DEVICE_VIEW_BOOL) |
+        (1u << CXCU_DEVICE_VIEW_UINT32);
+    out_capability->flags = CXCU_DEVICE_VIEW_READ_ONLY | CXCU_DEVICE_VIEW_WRITABLE |
+        CXCU_DEVICE_VIEW_CONTIGUOUS;
+    out_capability->device_available =
+        device_ordinal == 0 && cxcu_available(&availability);
+    cxcu_error_clear(err);
+    return 1;
+}
+
+void cxcu_device_view_plan_init(cxcu_device_view_plan* plan, int device_ordinal) {
+    if (!plan) return;
+    memset(plan, 0, sizeof(*plan));
+    plan->device_ordinal = device_ordinal;
+}
+
+void cxcu_device_view_plan_free(cxcu_device_view_plan* plan) {
+    size_t i;
+    int device_ordinal;
+    if (!plan) return;
+    device_ordinal = plan->device_ordinal;
+    for (i = 0u; i < plan->count; ++i) cxcu_buffer_free(&plan->entries[i].buffer);
+    cxcu_device_view_plan_init(plan, device_ordinal);
+}
+
+static int cxcu_device_view_binding_size(
+    const cxcu_device_view_binding* binding,
+    size_t* out_bytes,
+    cxcu_error* err) {
+    size_t elements = 1u;
+    size_t element_size;
+    size_t i;
+    if (!binding || !out_bytes || binding->rank == 0u ||
+        binding->rank > CXCU_DEVICE_VIEW_MAX_RANK || binding->generation == 0u ||
+        (binding->flags & CXCU_DEVICE_VIEW_CONTIGUOUS) == 0u ||
+        (binding->flags & (CXCU_DEVICE_VIEW_READ_ONLY | CXCU_DEVICE_VIEW_WRITABLE)) == 0u) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "invalid device view binding contract");
+        return 0;
+    }
+    element_size = cxcu_device_view_element_size(binding->element_type);
+    if (element_size == 0u) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "unsupported device view element type");
+        return 0;
+    }
+    for (i = 0u; i < binding->rank; ++i) {
+        if (binding->shape[i] == 0u || elements > SIZE_MAX / binding->shape[i]) {
+            cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "invalid or overflowing device view shape");
+            return 0;
+        }
+        elements *= binding->shape[i];
+    }
+    if (elements > SIZE_MAX / element_size || elements * element_size > binding->capacity_bytes) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "device view capacity is insufficient");
+        return 0;
+    }
+    if ((binding->flags & CXCU_DEVICE_VIEW_READ_ONLY) && !binding->host_data) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "read-only device view requires host data");
+        return 0;
+    }
+    *out_bytes = elements * element_size;
+    return 1;
+}
+
+static int cxcu_device_view_residency_matches(
+    const cxcu_device_view_residency* entry,
+    const cxcu_device_view_binding* binding) {
+    size_t i;
+    if (!entry->buffer.device_ptr || entry->generation != binding->generation ||
+        entry->element_type != binding->element_type || entry->rank != binding->rank ||
+        entry->flags != binding->flags) return 0;
+    for (i = 0u; i < binding->rank; ++i)
+        if (entry->shape[i] != binding->shape[i]) return 0;
+    return 1;
+}
+
+static void cxcu_device_view_resolve_descriptor(
+    const cxcu_device_view_residency* entry,
+    cxcu_device_view_descriptor* out) {
+    size_t stride = 1u;
+    size_t i;
+    memset(out, 0, sizeof(*out));
+    out->device_ptr = entry->buffer.device_ptr;
+    out->generation = entry->generation;
+    out->element_type = (uint32_t)entry->element_type;
+    out->rank = (uint32_t)entry->rank;
+    out->flags = entry->flags;
+    for (i = entry->rank; i > 0u; --i) {
+        out->shape[i - 1u] = entry->shape[i - 1u];
+        out->element_strides[i - 1u] = stride;
+        stride *= entry->shape[i - 1u];
+    }
+}
+
+int cxcu_device_view_plan_bind(
+    cxcu_device_view_plan* plan,
+    const cxcu_device_view_binding* bindings,
+    size_t count,
+    cxcu_device_view_descriptor* out_descriptors,
+    cxcu_error* err) {
+    size_t bytes[CXCU_DEVICE_VIEW_MAX_COUNT];
+    size_t i;
+    if (!plan || !bindings || !out_descriptors || count == 0u ||
+        count > CXCU_DEVICE_VIEW_MAX_COUNT) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "invalid device view plan arguments");
+        return 0;
+    }
+    if (plan->device_ordinal != 0) {
+        cxcu_set_error(err, CXCU_STATUS_UNAVAILABLE, 0,
+            "device view plan targets an unsupported CUDA device ordinal");
+        return 0;
+    }
+    for (i = 0u; i < count; ++i)
+        if (!cxcu_device_view_binding_size(&bindings[i], &bytes[i], err)) return 0;
+    for (i = 0u; i < count; ++i) {
+        cxcu_device_view_residency* entry = &plan->entries[i];
+        if (i < plan->count && cxcu_device_view_residency_matches(entry, &bindings[i])) {
+            ++plan->reuse_count;
+        } else {
+            cxcu_buffer replacement = {0};
+            int uploaded = (bindings[i].flags & CXCU_DEVICE_VIEW_READ_ONLY)
+                ? cxcu_buffer_alloc_upload(&replacement, bindings[i].host_data, bytes[i], err)
+                : cxcu_buffer_alloc(&replacement, bytes[i], err);
+            if (!uploaded) return 0;
+            cxcu_buffer_free(&entry->buffer);
+            memset(entry, 0, sizeof(*entry));
+            entry->buffer = replacement;
+            entry->generation = bindings[i].generation;
+            entry->element_type = bindings[i].element_type;
+            entry->rank = bindings[i].rank;
+            entry->flags = bindings[i].flags;
+            memcpy(entry->shape, bindings[i].shape, sizeof(entry->shape));
+            plan->uploaded_bytes += bytes[i];
+            ++plan->upload_count;
+        }
+        cxcu_device_view_resolve_descriptor(entry, &out_descriptors[i]);
+    }
+    for (i = count; i < plan->count; ++i) cxcu_buffer_free(&plan->entries[i].buffer);
+    plan->count = count;
+    cxcu_error_clear(err);
+    return 1;
+}
 
 #ifndef CXCU_CUDA_TOOLKIT_ROOT
 #define CXCU_CUDA_TOOLKIT_ROOT ""
@@ -541,7 +720,7 @@ static void cxcu_set_nvrtc_error(
             err,
             CXCU_STATUS_COMPILE_ERROR,
             (int)result,
-            "%s failed: %s: %.180s",
+            "%s failed: %s: %.1900s",
             operation ? operation : "NVRTC call",
             text ? text : "NVRTC_ERROR_UNKNOWN",
             log);
@@ -916,6 +1095,9 @@ static int cxcu_compile_cubin_for_device(
     const char* const* options,
     size_t option_count,
     int device_ordinal,
+    const char* name_expression,
+    char* out_lowered_name,
+    size_t out_lowered_name_size,
     cxcu_module_image* out_image,
     cxcu_error* err) {
     char arch_option[64];
@@ -967,6 +1149,13 @@ static int cxcu_compile_cubin_for_device(
         cxcu_set_nvrtc_error(err, result, "nvrtcCreateProgram", NULL);
         goto cleanup;
     }
+    if (name_expression) {
+        result = nvrtcAddNameExpression(program, name_expression);
+        if (result != NVRTC_SUCCESS) {
+            cxcu_set_nvrtc_error(err, result, "nvrtcAddNameExpression", NULL);
+            goto cleanup;
+        }
+    }
 
     result = nvrtcCompileProgram(program, (int)cubin_option_count, cubin_options);
     (void)nvrtcGetProgramLogSize(program, &log_size);
@@ -977,6 +1166,17 @@ static int cxcu_compile_cubin_for_device(
     if (result != NVRTC_SUCCESS) {
         cxcu_set_nvrtc_error(err, result, "nvrtcCompileProgram", log);
         goto cleanup;
+    }
+    if (name_expression) {
+        const char* lowered_name = NULL;
+        result = nvrtcGetLoweredName(program, name_expression, &lowered_name);
+        if (result != NVRTC_SUCCESS || !lowered_name || !out_lowered_name ||
+            out_lowered_name_size == 0u) {
+            cxcu_set_nvrtc_error(err, result, "nvrtcGetLoweredName", log);
+            goto cleanup;
+        }
+        (void)snprintf(out_lowered_name, out_lowered_name_size, "%s", lowered_name);
+        out_lowered_name[out_lowered_name_size - 1u] = '\0';
     }
 
     result = nvrtcGetCUBINSize(program, &cubin_size);
@@ -1040,6 +1240,9 @@ int cxcu_compile_module_image_for_device(
             options,
             option_count,
             device_ordinal,
+            NULL,
+            NULL,
+            0u,
             out_image,
             &cubin_err)) {
         cxcu_error_clear(err);
@@ -1059,6 +1262,26 @@ int cxcu_compile_module_image_for_device(
     ptx.size = 0u;
     cxcu_error_clear(err);
     return 1;
+}
+
+int cxcu_compile_named_module_image_for_device(
+    const char* cuda_source, const char* program_name,
+    const char* const* options, size_t option_count, int device_ordinal,
+    const char* name_expression, char* out_lowered_name,
+    size_t out_lowered_name_size, cxcu_module_image* out_image,
+    cxcu_error* err) {
+    if (!cuda_source || !name_expression || !out_lowered_name ||
+        out_lowered_name_size == 0u || !out_image) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0,
+                       "named module compile arguments are required");
+        return 0;
+    }
+    out_lowered_name[0] = '\0';
+    memset(out_image, 0, sizeof(*out_image));
+    return cxcu_compile_cubin_for_device(
+        cuda_source, program_name, options, option_count, device_ordinal,
+        name_expression, out_lowered_name, out_lowered_name_size,
+        out_image, err);
 }
 
 #else
@@ -1375,6 +1598,112 @@ int cxcu_launch(
         return 0;
     }
     cxcu_error_clear(err);
+    return 1;
+}
+
+int cxcu_run_kernel(cxcu_module* module, const char* kernel_name,
+                    const cxcu_launch_config* cfg, const cxcu_arg* args,
+                    size_t arg_count, cxcu_error* err) {
+    cxcu_buffer* buffers = NULL;
+    cxcu_buffer** storage = NULL;
+    uint64_t* device_ptrs = NULL;
+    void** launch_args = NULL;
+    cxcu_buffer_group group;
+    int ok = 0;
+    if (!module || !kernel_name || !cfg || (arg_count && !args)) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0,
+                       "kernel run arguments are required");
+        return 0;
+    }
+    buffers = (cxcu_buffer*)calloc(arg_count, sizeof(*buffers));
+    storage = (cxcu_buffer**)calloc(arg_count, sizeof(*storage));
+    device_ptrs = (uint64_t*)calloc(arg_count, sizeof(*device_ptrs));
+    launch_args = (void**)calloc(arg_count, sizeof(*launch_args));
+    if (arg_count && (!buffers || !storage || !device_ptrs || !launch_args)) {
+        cxcu_set_error(err, CXCU_STATUS_OUT_OF_MEMORY, 0,
+                       "out of memory preparing kernel arguments");
+        goto cleanup;
+    }
+    cxcu_buffer_group_init(&group, storage, arg_count);
+    for (size_t i = 0u; i < arg_count; ++i) {
+        if (args[i].kind == CXCU_ARG_SCALAR) {
+            if (!args[i].host_ptr || args[i].bytes == 0u) {
+                cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0,
+                               "scalar kernel argument is empty");
+                goto cleanup_group;
+            }
+            launch_args[i] = args[i].host_ptr;
+            continue;
+        }
+        if (args[i].kind != CXCU_ARG_IN && args[i].kind != CXCU_ARG_OUT &&
+            args[i].kind != CXCU_ARG_INOUT) {
+            cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0,
+                           "unknown kernel argument kind");
+            goto cleanup_group;
+        }
+        if (args[i].bytes != 0u && !args[i].host_ptr) {
+            cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0,
+                           "kernel buffer argument has no host storage");
+            goto cleanup_group;
+        }
+        if (args[i].bytes != 0u) {
+            const int allocated = args[i].kind == CXCU_ARG_IN ||
+                                  args[i].kind == CXCU_ARG_INOUT
+                ? cxcu_buffer_group_alloc_upload(&group, &buffers[i],
+                                                 args[i].host_ptr, args[i].bytes, err)
+                : cxcu_buffer_group_alloc(&group, &buffers[i], args[i].bytes, err);
+            if (!allocated) goto cleanup_group;
+            device_ptrs[i] = (uint64_t)buffers[i].device_ptr;
+        }
+        launch_args[i] = &device_ptrs[i];
+    }
+    if (!cxcu_launch(module, kernel_name, cfg, launch_args, err) ||
+        !cxcu_synchronize(err)) goto cleanup_group;
+    for (size_t i = 0u; i < arg_count; ++i) {
+        if ((args[i].kind == CXCU_ARG_OUT || args[i].kind == CXCU_ARG_INOUT) &&
+            args[i].bytes != 0u &&
+            !cxcu_memcpy_d2h(args[i].host_ptr, &buffers[i], args[i].bytes, err))
+            goto cleanup_group;
+    }
+    ok = 1;
+cleanup_group:
+    cxcu_buffer_group_free_all(&group);
+cleanup:
+    free(launch_args);
+    free(device_ptrs);
+    free(storage);
+    free(buffers);
+    return ok;
+}
+
+int cxcu_query_kernel_state_size(cxcu_module* module, const char* kernel_name,
+                                 size_t* out_size, cxcu_error* err) {
+    size_t candidate_count = 1u;
+    size_t zero = 0u;
+    cxcu_launch_config cfg = {1u, 1u, 1u, 1u, 1u, 1u, 0u, NULL};
+    cxcu_arg args[] = {
+        {CXCU_ARG_OUT, out_size, sizeof(*out_size)},
+        {CXCU_ARG_IN, NULL, 0u}, {CXCU_ARG_IN, NULL, 0u},
+        {CXCU_ARG_IN, NULL, 0u}, {CXCU_ARG_IN, NULL, 0u},
+        {CXCU_ARG_IN, NULL, 0u},
+        {CXCU_ARG_SCALAR, &candidate_count, sizeof(candidate_count)},
+        {CXCU_ARG_SCALAR, &zero, sizeof(zero)},
+        {CXCU_ARG_SCALAR, &zero, sizeof(zero)},
+        {CXCU_ARG_SCALAR, &zero, sizeof(zero)}
+    };
+    if (!out_size) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0,
+                       "state size output is required");
+        return 0;
+    }
+    *out_size = 0u;
+    if (!cxcu_run_kernel(module, kernel_name, &cfg, args,
+                         sizeof(args) / sizeof(args[0]), err)) return 0;
+    if (*out_size == 0u) {
+        cxcu_set_error(err, CXCU_STATUS_CUDA_ERROR, 0,
+                       "kernel returned an empty state size");
+        return 0;
+    }
     return 1;
 }
 
@@ -1778,6 +2107,25 @@ int cxcu_launch(
     (void)kernel_name;
     (void)cfg;
     (void)args;
+    return cxcu_stub_unavailable(err);
+}
+
+int cxcu_run_kernel(cxcu_module* module, const char* kernel_name,
+                    const cxcu_launch_config* cfg, const cxcu_arg* args,
+                    size_t arg_count, cxcu_error* err) {
+    (void)module;
+    (void)kernel_name;
+    (void)cfg;
+    (void)args;
+    (void)arg_count;
+    return cxcu_stub_unavailable(err);
+}
+
+int cxcu_query_kernel_state_size(cxcu_module* module, const char* kernel_name,
+                                 size_t* out_size, cxcu_error* err) {
+    (void)module;
+    (void)kernel_name;
+    if (out_size) *out_size = 0u;
     return cxcu_stub_unavailable(err);
 }
 
