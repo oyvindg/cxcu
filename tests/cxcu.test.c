@@ -430,6 +430,48 @@ static void test_optional_run_kernel_helpers(void) {
     printf("  ok test_optional_run_kernel_helpers\n");
 }
 
+static void test_device_view_residency(void) {
+    const double values[] = {1.0, 2.0, 3.0, 4.0, 5.0, 6.0};
+    cxcu_device_view_binding binding = {
+        .host_data = values,
+        .element_type = CXCU_DEVICE_VIEW_NUMBER,
+        .rank = 2u,
+        .shape = {2u, 3u},
+        .capacity_bytes = sizeof(values),
+        .generation = 17u,
+        .flags = CXCU_DEVICE_VIEW_READ_ONLY | CXCU_DEVICE_VIEW_CONTIGUOUS,
+    };
+    cxcu_device_view_descriptor descriptor = {0};
+    cxcu_device_view_capability capability = {0};
+    cxcu_device_view_plan plan;
+    cxcu_error err = {0};
+    assert(cxcu_device_view_capability_get(0, &capability, &err));
+    assert(capability.abi_version == CXCU_DEVICE_VIEW_ABI_VERSION);
+    assert((capability.element_types & (1u << CXCU_DEVICE_VIEW_UINT32)) != 0u);
+    assert(capability.max_rank == 4u);
+    cxcu_device_view_plan_init(&plan, 0);
+    if (!capability.device_available) {
+        assert(!cxcu_device_view_plan_bind(&plan, &binding, 1u, &descriptor, &err));
+        assert(err.status == CXCU_STATUS_UNAVAILABLE || err.status == CXCU_STATUS_CUDA_ERROR);
+        printf("  ok test_device_view_residency skipped: %s\n", err.message);
+        return;
+    }
+    assert(cxcu_device_view_plan_bind(&plan, &binding, 1u, &descriptor, &err));
+    assert(descriptor.device_ptr != 0u);
+    assert(descriptor.rank == 2u);
+    assert(descriptor.shape[0] == 2u && descriptor.shape[1] == 3u);
+    assert(descriptor.element_strides[0] == 3u && descriptor.element_strides[1] == 1u);
+    assert(plan.upload_count == 1u && plan.reuse_count == 0u);
+    assert(cxcu_device_view_plan_bind(&plan, &binding, 1u, &descriptor, &err));
+    assert(plan.upload_count == 1u && plan.reuse_count == 1u);
+    binding.generation = 18u;
+    assert(cxcu_device_view_plan_bind(&plan, &binding, 1u, &descriptor, &err));
+    assert(plan.upload_count == 2u && descriptor.generation == 18u);
+    cxcu_device_view_plan_free(&plan);
+    cxcu_shutdown();
+    printf("  ok test_device_view_residency\n");
+}
+
 int main(void) {
     test_status_names();
     test_error_clear();
@@ -442,5 +484,6 @@ int main(void) {
     test_optional_nvrtc_default_include_smoke();
     test_optional_nvrtc_compile_smoke();
     test_optional_run_kernel_helpers();
+    test_device_view_residency();
     return 0;
 }

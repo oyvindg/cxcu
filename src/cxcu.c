@@ -6,12 +6,191 @@
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
+#include <stddef.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
+
+static void cxcu_set_error(
+    cxcu_error* err,
+    cxcu_status status,
+    int cuda_code,
+    const char* format,
+    ...);
+
+_Static_assert(sizeof(cxcu_device_view_descriptor) == 96u,
+    "device view descriptor ABI must match cxcu/device_view.cuh");
+
+static size_t cxcu_device_view_element_size(cxcu_device_view_element_type type) {
+    switch (type) {
+        case CXCU_DEVICE_VIEW_NUMBER: return sizeof(double);
+        case CXCU_DEVICE_VIEW_INT64: return sizeof(int64_t);
+        case CXCU_DEVICE_VIEW_BOOL: return sizeof(uint8_t);
+        case CXCU_DEVICE_VIEW_UINT32: return sizeof(uint32_t);
+        default: return 0u;
+    }
+}
+
+int cxcu_device_view_capability_get(
+    int device_ordinal,
+    cxcu_device_view_capability* out_capability,
+    cxcu_error* err) {
+    cxcu_error availability = {0};
+    if (!out_capability) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "device view capability output is required");
+        return 0;
+    }
+    memset(out_capability, 0, sizeof(*out_capability));
+    out_capability->abi_version = CXCU_DEVICE_VIEW_ABI_VERSION;
+    out_capability->max_rank = CXCU_DEVICE_VIEW_MAX_RANK;
+    out_capability->max_views = CXCU_DEVICE_VIEW_MAX_COUNT;
+    out_capability->element_types =
+        (1u << CXCU_DEVICE_VIEW_NUMBER) |
+        (1u << CXCU_DEVICE_VIEW_INT64) |
+        (1u << CXCU_DEVICE_VIEW_BOOL) |
+        (1u << CXCU_DEVICE_VIEW_UINT32);
+    out_capability->flags = CXCU_DEVICE_VIEW_READ_ONLY | CXCU_DEVICE_VIEW_WRITABLE |
+        CXCU_DEVICE_VIEW_CONTIGUOUS;
+    out_capability->device_available =
+        device_ordinal == 0 && cxcu_available(&availability);
+    cxcu_error_clear(err);
+    return 1;
+}
+
+void cxcu_device_view_plan_init(cxcu_device_view_plan* plan, int device_ordinal) {
+    if (!plan) return;
+    memset(plan, 0, sizeof(*plan));
+    plan->device_ordinal = device_ordinal;
+}
+
+void cxcu_device_view_plan_free(cxcu_device_view_plan* plan) {
+    size_t i;
+    int device_ordinal;
+    if (!plan) return;
+    device_ordinal = plan->device_ordinal;
+    for (i = 0u; i < plan->count; ++i) cxcu_buffer_free(&plan->entries[i].buffer);
+    cxcu_device_view_plan_init(plan, device_ordinal);
+}
+
+static int cxcu_device_view_binding_size(
+    const cxcu_device_view_binding* binding,
+    size_t* out_bytes,
+    cxcu_error* err) {
+    size_t elements = 1u;
+    size_t element_size;
+    size_t i;
+    if (!binding || !out_bytes || binding->rank == 0u ||
+        binding->rank > CXCU_DEVICE_VIEW_MAX_RANK || binding->generation == 0u ||
+        (binding->flags & CXCU_DEVICE_VIEW_CONTIGUOUS) == 0u ||
+        (binding->flags & (CXCU_DEVICE_VIEW_READ_ONLY | CXCU_DEVICE_VIEW_WRITABLE)) == 0u) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "invalid device view binding contract");
+        return 0;
+    }
+    element_size = cxcu_device_view_element_size(binding->element_type);
+    if (element_size == 0u) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "unsupported device view element type");
+        return 0;
+    }
+    for (i = 0u; i < binding->rank; ++i) {
+        if (binding->shape[i] == 0u || elements > SIZE_MAX / binding->shape[i]) {
+            cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "invalid or overflowing device view shape");
+            return 0;
+        }
+        elements *= binding->shape[i];
+    }
+    if (elements > SIZE_MAX / element_size || elements * element_size > binding->capacity_bytes) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "device view capacity is insufficient");
+        return 0;
+    }
+    if ((binding->flags & CXCU_DEVICE_VIEW_READ_ONLY) && !binding->host_data) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "read-only device view requires host data");
+        return 0;
+    }
+    *out_bytes = elements * element_size;
+    return 1;
+}
+
+static int cxcu_device_view_residency_matches(
+    const cxcu_device_view_residency* entry,
+    const cxcu_device_view_binding* binding) {
+    size_t i;
+    if (!entry->buffer.device_ptr || entry->generation != binding->generation ||
+        entry->element_type != binding->element_type || entry->rank != binding->rank ||
+        entry->flags != binding->flags) return 0;
+    for (i = 0u; i < binding->rank; ++i)
+        if (entry->shape[i] != binding->shape[i]) return 0;
+    return 1;
+}
+
+static void cxcu_device_view_resolve_descriptor(
+    const cxcu_device_view_residency* entry,
+    cxcu_device_view_descriptor* out) {
+    size_t stride = 1u;
+    size_t i;
+    memset(out, 0, sizeof(*out));
+    out->device_ptr = entry->buffer.device_ptr;
+    out->generation = entry->generation;
+    out->element_type = (uint32_t)entry->element_type;
+    out->rank = (uint32_t)entry->rank;
+    out->flags = entry->flags;
+    for (i = entry->rank; i > 0u; --i) {
+        out->shape[i - 1u] = entry->shape[i - 1u];
+        out->element_strides[i - 1u] = stride;
+        stride *= entry->shape[i - 1u];
+    }
+}
+
+int cxcu_device_view_plan_bind(
+    cxcu_device_view_plan* plan,
+    const cxcu_device_view_binding* bindings,
+    size_t count,
+    cxcu_device_view_descriptor* out_descriptors,
+    cxcu_error* err) {
+    size_t bytes[CXCU_DEVICE_VIEW_MAX_COUNT];
+    size_t i;
+    if (!plan || !bindings || !out_descriptors || count == 0u ||
+        count > CXCU_DEVICE_VIEW_MAX_COUNT) {
+        cxcu_set_error(err, CXCU_STATUS_INVALID_ARGUMENT, 0, "invalid device view plan arguments");
+        return 0;
+    }
+    if (plan->device_ordinal != 0) {
+        cxcu_set_error(err, CXCU_STATUS_UNAVAILABLE, 0,
+            "device view plan targets an unsupported CUDA device ordinal");
+        return 0;
+    }
+    for (i = 0u; i < count; ++i)
+        if (!cxcu_device_view_binding_size(&bindings[i], &bytes[i], err)) return 0;
+    for (i = 0u; i < count; ++i) {
+        cxcu_device_view_residency* entry = &plan->entries[i];
+        if (i < plan->count && cxcu_device_view_residency_matches(entry, &bindings[i])) {
+            ++plan->reuse_count;
+        } else {
+            cxcu_buffer replacement = {0};
+            int uploaded = (bindings[i].flags & CXCU_DEVICE_VIEW_READ_ONLY)
+                ? cxcu_buffer_alloc_upload(&replacement, bindings[i].host_data, bytes[i], err)
+                : cxcu_buffer_alloc(&replacement, bytes[i], err);
+            if (!uploaded) return 0;
+            cxcu_buffer_free(&entry->buffer);
+            memset(entry, 0, sizeof(*entry));
+            entry->buffer = replacement;
+            entry->generation = bindings[i].generation;
+            entry->element_type = bindings[i].element_type;
+            entry->rank = bindings[i].rank;
+            entry->flags = bindings[i].flags;
+            memcpy(entry->shape, bindings[i].shape, sizeof(entry->shape));
+            plan->uploaded_bytes += bytes[i];
+            ++plan->upload_count;
+        }
+        cxcu_device_view_resolve_descriptor(entry, &out_descriptors[i]);
+    }
+    for (i = count; i < plan->count; ++i) cxcu_buffer_free(&plan->entries[i].buffer);
+    plan->count = count;
+    cxcu_error_clear(err);
+    return 1;
+}
 
 #ifndef CXCU_CUDA_TOOLKIT_ROOT
 #define CXCU_CUDA_TOOLKIT_ROOT ""

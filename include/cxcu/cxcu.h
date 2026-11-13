@@ -25,6 +25,54 @@ extern "C" {
 /** @brief Patch version of the cxcu API. */
 #define CXCU_VERSION_PATCH 0
 
+#define CXCU_DEVICE_VIEW_ABI_VERSION 1u
+#define CXCU_DEVICE_VIEW_MAX_RANK 4u
+#define CXCU_DEVICE_VIEW_MAX_COUNT 32u
+
+typedef enum cxcu_device_view_element_type {
+    CXCU_DEVICE_VIEW_NUMBER = 1,
+    CXCU_DEVICE_VIEW_INT64 = 2,
+    CXCU_DEVICE_VIEW_BOOL = 3,
+    CXCU_DEVICE_VIEW_UINT32 = 4
+} cxcu_device_view_element_type;
+
+typedef enum cxcu_device_view_flags {
+    CXCU_DEVICE_VIEW_READ_ONLY = 1u << 0,
+    CXCU_DEVICE_VIEW_WRITABLE = 1u << 1,
+    CXCU_DEVICE_VIEW_CONTIGUOUS = 1u << 2
+} cxcu_device_view_flags;
+
+typedef struct cxcu_device_view_capability {
+    unsigned abi_version;
+    unsigned max_rank;
+    unsigned max_views;
+    unsigned element_types;
+    unsigned flags;
+    int device_available;
+} cxcu_device_view_capability;
+
+typedef struct cxcu_device_view_binding {
+    const void* host_data;
+    cxcu_device_view_element_type element_type;
+    size_t rank;
+    size_t shape[CXCU_DEVICE_VIEW_MAX_RANK];
+    size_t capacity_bytes;
+    uint64_t generation;
+    unsigned flags;
+} cxcu_device_view_binding;
+
+/** Compact descriptor copied into generated CUDA launch arguments. */
+typedef struct cxcu_device_view_descriptor {
+    uintptr_t device_ptr;
+    uint64_t generation;
+    uint64_t shape[CXCU_DEVICE_VIEW_MAX_RANK];
+    uint64_t element_strides[CXCU_DEVICE_VIEW_MAX_RANK];
+    uint32_t element_type;
+    uint32_t rank;
+    uint32_t flags;
+    uint32_t reserved;
+} cxcu_device_view_descriptor;
+
 /** @brief Status codes reported by cxcu operations. */
 typedef enum cxcu_status {
     /** Operation completed successfully. */
@@ -72,6 +120,24 @@ typedef struct cxcu_buffer {
     /** Allocation size in bytes. */
     size_t bytes;
 } cxcu_buffer;
+
+typedef struct cxcu_device_view_residency {
+    cxcu_buffer buffer;
+    uint64_t generation;
+    cxcu_device_view_element_type element_type;
+    size_t rank;
+    size_t shape[CXCU_DEVICE_VIEW_MAX_RANK];
+    unsigned flags;
+} cxcu_device_view_residency;
+
+typedef struct cxcu_device_view_plan {
+    int device_ordinal;
+    cxcu_device_view_residency entries[CXCU_DEVICE_VIEW_MAX_COUNT];
+    size_t count;
+    size_t uploaded_bytes;
+    size_t upload_count;
+    size_t reuse_count;
+} cxcu_device_view_plan;
 
 /** @brief Caller-owned group of buffers that can be freed together. */
 typedef struct cxcu_buffer_group {
@@ -210,6 +276,29 @@ int cxcu_device_count(int* out_count, cxcu_error* err);
  * @return 1 on success, otherwise 0.
  */
 int cxcu_device_info_get(int ordinal, cxcu_device_info* out_info, cxcu_error* err);
+
+/** Query the generic contiguous device-view capability. */
+int cxcu_device_view_capability_get(
+    int device_ordinal,
+    cxcu_device_view_capability* out_capability,
+    cxcu_error* err);
+
+/** Initialize an empty reusable device-view residency plan. */
+void cxcu_device_view_plan_init(cxcu_device_view_plan* plan, int device_ordinal);
+
+/** Release every resident generation owned by a plan. */
+void cxcu_device_view_plan_free(cxcu_device_view_plan* plan);
+
+/**
+ * Validate bindings, upload changed immutable generations, and resolve compact
+ * launch descriptors. Equal generations and shapes reuse resident storage.
+ */
+int cxcu_device_view_plan_bind(
+    cxcu_device_view_plan* plan,
+    const cxcu_device_view_binding* bindings,
+    size_t count,
+    cxcu_device_view_descriptor* out_descriptors,
+    cxcu_error* err);
 
 /**
  * @brief Create a CUDA stream in the current cxcu context.
